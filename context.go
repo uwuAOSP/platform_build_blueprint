@@ -493,6 +493,10 @@ func (c *Context) loadOrCreateVariantOnDemand(config any, module *moduleInfo, de
 		variantSb.WriteString("-")
 		variantSb.WriteString(variant.variations[mutator])
 	}
+	for _, mutator := range slices.Sorted(maps.Keys(module.requestedOnDemandVariant.variations)) {
+		variantSb.WriteString("-")
+		variantSb.WriteString(variant.variations[mutator])
+	}
 	for _, oti := range moduleOutgoingTransitionInfos {
 		if oti != nil && oti.Variation() != "" {
 			variantSb.WriteString("-")
