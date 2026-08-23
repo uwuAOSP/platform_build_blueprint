@@ -1,4 +1,5 @@
 // Copyright 2014 Google Inc. All rights reserved.
+// Copyright (C) 2026 The uwuAOSP Project
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -3323,6 +3324,24 @@ func (c *Context) GetWeightedOutputsFromPredicate(predicate func(*WeightedOutput
 		}
 	}
 	return outputToWeight
+}
+
+func (c *Context) GetModuleNamesWithRules(rules map[string]struct{}) []string {
+	modules := make(map[string]struct{})
+	for module := range c.iterateAllVariants() {
+		for _, build := range module.actionDefs.buildDefs {
+			if _, found := rules[build.Rule.name()]; found {
+				modules[module.Name()] = struct{}{}
+				break
+			}
+		}
+	}
+	names := make([]string, 0, len(modules))
+	for module := range modules {
+		names = append(names, module)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // PrepareBuildActions generates an internal representation of all the build
