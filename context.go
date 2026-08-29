@@ -3295,6 +3295,7 @@ type WeightedOutputsModuleInfo struct {
 	DepsCount int
 	SrcsCount int
 	Outputs   []string
+	Rules     []string
 }
 
 func (c *Context) GetWeightedOutputsFromPredicate(predicate func(*WeightedOutputsModuleInfo) (bool, int)) map[string]int {
@@ -3306,6 +3307,7 @@ func (c *Context) GetWeightedOutputsFromPredicate(predicate func(*WeightedOutput
 			SrcsCount: 0,
 		}
 		for _, bDef := range m.actionDefs.buildDefs {
+			info.Rules = append(info.Rules, bDef.Rule.name())
 			info.SrcsCount += len(bDef.InputStrings) + len(bDef.Inputs) + len(bDef.ImplicitStrings) + len(bDef.Implicits)
 			info.Outputs = append(info.Outputs, bDef.OutputStrings...)
 			info.Outputs = append(info.Outputs, bDef.ImplicitOutputStrings...)
@@ -3342,6 +3344,51 @@ func (c *Context) GetModuleNamesWithRules(rules map[string]struct{}) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+type ModuleBuildAction struct {
+	Module  string
+	Rule    string
+	Outputs []string
+}
+
+// GetModuleBuildActions returns deterministic module, rule, and output metadata
+// for generated Ninja actions. It does not expose commands or dependency edges.
+func (c *Context) GetModuleBuildActions() []ModuleBuildAction {
+	var actions []ModuleBuildAction
+	c.VisitModuleBuildActions(func(action ModuleBuildAction) {
+		actions = append(actions, action)
+	})
+	sort.Slice(actions, func(i, j int) bool {
+		if actions[i].Module != actions[j].Module {
+			return actions[i].Module < actions[j].Module
+		}
+		if actions[i].Rule != actions[j].Rule {
+			return actions[i].Rule < actions[j].Rule
+		}
+		return strings.Join(actions[i].Outputs, "\x00") < strings.Join(actions[j].Outputs, "\x00")
+	})
+	return actions
+}
+
+// VisitModuleBuildActions visits actions without retaining metadata for the
+// complete graph in memory.
+func (c *Context) VisitModuleBuildActions(visit func(ModuleBuildAction)) {
+	for module := range c.iterateAllVariants() {
+		for _, build := range module.actionDefs.buildDefs {
+			outputs := append([]string(nil), build.OutputStrings...)
+			outputs = append(outputs, build.ImplicitOutputStrings...)
+			outputs = append(outputs, getNinjaStrings(build.Outputs, c.nameTracker)...)
+			outputs = append(outputs, getNinjaStrings(build.ImplicitOutputs, c.nameTracker)...)
+			sort.Strings(outputs)
+			outputs = slices.Compact(outputs)
+			visit(ModuleBuildAction{
+				Module:  module.Name(),
+				Rule:    build.Rule.name(),
+				Outputs: outputs,
+			})
+		}
+	}
 }
 
 // PrepareBuildActions generates an internal representation of all the build
