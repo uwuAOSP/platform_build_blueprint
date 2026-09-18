@@ -145,6 +145,8 @@ type Context struct {
 
 	// Used for metrics-related event logging.
 	EventHandler *metrics.EventHandler
+	eventStartedHook  func(string)
+	eventProgressHook func(string, int, int)
 
 	BeforePrepareBuildActionsHook func() error
 
@@ -5927,11 +5929,22 @@ func (c *Context) GetEventHandler() *metrics.EventHandler {
 }
 
 func (c *Context) BeginEvent(name string) {
+	if c.eventStartedHook != nil {
+		c.eventStartedHook(name)
+	}
 	c.EventHandler.Begin(name)
 }
 
 func (c *Context) EndEvent(name string) {
 	c.EventHandler.End(name)
+}
+
+func (c *Context) SetEventStartedHook(hook func(string)) {
+	c.eventStartedHook = hook
+}
+
+func (c *Context) SetEventProgressHook(hook func(string, int, int)) {
+	c.eventProgressHook = hook
 }
 
 func (c *Context) SetBeforePrepareBuildActionsHook(hookFn func() error) {
