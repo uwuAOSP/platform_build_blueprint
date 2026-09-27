@@ -1399,11 +1399,22 @@ func (c *Context) ListModulePaths(baseDir string) (paths []string, err error) {
 
 	text = strings.Trim(text, "\n")
 	lines := strings.Split(text, "\n")
-	for i := range lines {
-		lines[i] = filepath.Join(baseDir, lines[i])
+	paths = make([]string, 0, len(lines))
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		path := filepath.Join(baseDir, line)
+		if _, statErr := c.fs.Lstat(path); statErr != nil {
+			if os.IsNotExist(statErr) {
+				continue
+			}
+			return nil, statErr
+		}
+		paths = append(paths, path)
 	}
 
-	return lines, nil
+	return paths, nil
 }
 
 // a fileParseContext tells the status of parsing a particular file
