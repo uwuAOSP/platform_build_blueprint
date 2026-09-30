@@ -16,12 +16,16 @@ package blueprint
 
 import (
 	"cmp"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"text/scanner"
+	"time"
 
 	"github.com/google/blueprint/parser"
 	"github.com/google/blueprint/pathtools"
@@ -114,6 +118,14 @@ type Module interface {
 
 	info() *moduleInfo
 	setInfo(*moduleInfo)
+}
+
+// ModuleSourceDeclarationName is implemented by modules whose Name method
+// contains runtime-only identity. SourceDeclarationName must return a stable
+// source-level name; Blueprint combines it with the declaration position to
+// keep repeated declarations unique within a file.
+type ModuleSourceDeclarationName interface {
+	SourceDeclarationName() string
 }
 
 type ModuleOrProxy interface {
@@ -975,14 +987,121 @@ func (m *baseModuleContext) CaptureModuleForTests() bool {
 
 type mutatorContext struct {
 	baseModuleContext
-	mutator          *mutatorInfo
-	reverseDeps      []reverseDep
-	rename           []rename
-	replace          []replace
-	newVariations    moduleList    // new variants of existing modules
-	newModules       []*moduleInfo // brand new modules
-	defaultVariation *string
-	pauseFunc        pauseFunc
+	mutator                   *mutatorInfo
+	reverseDeps               []reverseDep
+	rename                    []rename
+	replace                   []replace
+	newVariations             moduleList    // new variants of existing modules
+	newModules                []*moduleInfo // brand new modules
+	defaultVariation          *string
+	pauseFunc                 pauseFunc
+	dependencyResolutionCache *dependencyResolutionCache
+}
+
+type dependencyResolutionCache struct {
+	key         []byte
+	entries     map[string]dependencyResolutionTarget
+	loaded      bool
+	readAllowed bool
+	dirty       bool
+	hits        *atomic.Uint64
+	misses      *atomic.Uint64
+	elapsed     *atomic.Int64
+}
+
+type dependencyResolutionTarget struct {
+	Variant               string
+	ModuleKey             string
+	SourceDeclarationKey  string
+	SourceDeclarationHash string
+}
+
+type dependencyResolutionRequest struct {
+	Name       string
+	TagHash    string
+	Variations []Variation
+	Far        bool
+	Reverse    bool
+}
+
+func (mctx *mutatorContext) dependencyResolutionRequestKey(name string, tag DependencyTag, variations []Variation, far, reverse bool) (string, bool) {
+	tagHash, err := proptools.CalculateHashReflection(tag)
+	if err != nil {
+		return "", false
+	}
+	request := dependencyResolutionRequest{
+		Name:       name,
+		TagHash:    fmt.Sprintf("%x", tagHash),
+		Variations: slices.Clone(variations),
+		Far:        far,
+		Reverse:    reverse,
+	}
+	data, err := json.Marshal(request)
+	if err != nil {
+		return "", false
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(data)), true
+}
+
+func (mctx *mutatorContext) findDependencyVariant(possibleDeps *moduleGroup, name string, tag DependencyTag,
+	variations []Variation, far, reverse bool) (*moduleInfo, variationMap, []error) {
+	cache := mctx.dependencyResolutionCache
+	if cache == nil {
+		return mctx.context.findVariant(mctx.config, mctx.module, tag, possibleDeps, variations, far, reverse, mctx.mutator.index)
+	}
+	if cache.elapsed != nil {
+		lookupStarted := time.Now()
+		defer func() {
+			cache.elapsed.Add(int64(time.Since(lookupStarted)))
+		}()
+	}
+	requestKey, ok := mctx.dependencyResolutionRequestKey(name, tag, variations, far, reverse)
+	if !ok {
+		return mctx.context.findVariant(mctx.config, mctx.module, tag, possibleDeps, variations, far, reverse, mctx.mutator.index)
+	}
+	if !cache.loaded {
+		cache.loaded = true
+		if cache.readAllowed {
+			state, err := mctx.context.keyValueStoreCache.readDependencyResolution(mctx.context.EncContext, cache.key)
+			if err == nil && state != "" {
+				if json.Unmarshal([]byte(state), &cache.entries) != nil {
+					cache.entries = nil
+				}
+			}
+		}
+		if cache.entries == nil {
+			cache.entries = make(map[string]dependencyResolutionTarget)
+		}
+	}
+	if targetIdentity, found := cache.entries[requestKey]; found {
+		if target := possibleDeps.moduleByVariantName(targetIdentity.Variant); target != nil {
+			sourceHash, hasSourceHash := mctx.context.sourceModuleDeclarations[target.sourceDeclarationKey]
+			if hasSourceHash && target.moduleCacheKey() == targetIdentity.ModuleKey &&
+				target.sourceDeclarationKey == targetIdentity.SourceDeclarationKey &&
+				fmt.Sprintf("%x", sourceHash) == targetIdentity.SourceDeclarationHash {
+				if cache.hits != nil {
+					cache.hits.Add(1)
+				}
+				return target, target.variant.variations.clone(), nil
+			}
+		}
+	}
+	if cache.misses != nil {
+		cache.misses.Add(1)
+	}
+	found, newVariant, errs := mctx.context.findVariant(mctx.config, mctx.module, tag, possibleDeps, variations, far, reverse, mctx.mutator.index)
+	if found != nil && !found.createdOnDemand && found.sourceDeclarationKey != "" && len(errs) == 0 {
+		if sourceHash, hasSourceHash := mctx.context.sourceModuleDeclarations[found.sourceDeclarationKey]; hasSourceHash {
+			cache.entries[requestKey] = dependencyResolutionTarget{
+				Variant:               found.variant.name,
+				ModuleKey:             found.moduleCacheKey(),
+				SourceDeclarationKey:  found.sourceDeclarationKey,
+				SourceDeclarationHash: fmt.Sprintf("%x", sourceHash),
+			}
+			cache.dirty = true
+		}
+	}
+	return found, newVariant, errs
 }
 
 type BottomUpMutatorContext interface {
@@ -1111,7 +1230,7 @@ func (mctx *mutatorContext) AddDependency(module Module, tag DependencyTag, deps
 	depInfos := make([]ModuleProxy, 0, len(deps))
 	for _, dep := range deps {
 		modInfo := module.info()
-		di, errs := mctx.context.addVariationDependency(modInfo, mctx.mutator, mctx.config, nil, tag, dep, false)
+		di, errs := mctx.context.addVariationDependency(mctx, modInfo, nil, tag, dep, false)
 		if len(errs) > 0 {
 			mctx.errs = append(mctx.errs, errs...)
 		}
@@ -1168,7 +1287,7 @@ func (mctx *mutatorContext) AddReverseVariationDependency(variations []Variation
 		return
 	}
 
-	found, newVariant, errs := mctx.context.findVariant(mctx.config, mctx.module, tag, possibleDeps, variations, false, true, -1)
+	found, newVariant, errs := mctx.findDependencyVariant(possibleDeps, name, tag, variations, false, true)
 	if errs != nil {
 		mctx.errs = append(mctx.errs, errs...)
 		return
@@ -1201,7 +1320,7 @@ func (mctx *mutatorContext) AddVariationDependencies(variations []Variation, tag
 
 	depInfos := make([]ModuleProxy, 0, len(deps))
 	for _, dep := range deps {
-		di, errs := mctx.context.addVariationDependency(mctx.module, mctx.mutator, mctx.config, variations, tag, dep, false)
+		di, errs := mctx.context.addVariationDependency(mctx, mctx.module, variations, tag, dep, false)
 		if len(errs) > 0 {
 			mctx.errs = append(mctx.errs, errs...)
 		}
@@ -1229,7 +1348,7 @@ func (mctx *mutatorContext) AddFarVariationDependencies(variations []Variation, 
 
 	depInfos := make([]ModuleProxy, 0, len(deps))
 	for _, dep := range deps {
-		di, errs := mctx.context.addVariationDependency(mctx.module, mctx.mutator, mctx.config, variations, tag, dep, true)
+		di, errs := mctx.context.addVariationDependency(mctx, mctx.module, variations, tag, dep, true)
 		if len(errs) > 0 {
 			mctx.errs = append(mctx.errs, errs...)
 		}

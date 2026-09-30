@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"reflect"
 	"slices"
 	"strconv"
@@ -495,6 +496,7 @@ func TestCreateModule(t *testing.T) {
 	}
 
 	a := ctx.moduleGroupFromName("A", nil).modules.firstModule().logicModule.(*fooModule)
+	creator := ctx.moduleGroupFromName("A", nil).modules.firstModule()
 	b := ctx.moduleGroupFromName("B", nil).modules.firstModule().logicModule.(*barModule)
 	c := ctx.moduleGroupFromName("C", nil).modules.firstModule().logicModule.(*barModule)
 	d := ctx.moduleGroupFromName("D", nil).modules.firstModule().logicModule.(*fooModule)
@@ -515,6 +517,9 @@ func TestCreateModule(t *testing.T) {
 	checkDeps(b, "D")
 	checkDeps(c, "D")
 	checkDeps(d, "")
+	if len(ctx.createdModuleGroups[creator]) != 3 {
+		t.Errorf("createdModuleGroups[%p] = %d groups, want 3", creator, len(ctx.createdModuleGroups[creator]))
+	}
 }
 
 func createTestMutator(ctx BottomUpMutatorContext) {
@@ -669,6 +674,253 @@ func TestParseFailsForModuleWithoutName(t *testing.T) {
 	}
 }
 
+func Test_variationMapEqualMatching(t *testing.T) {
+	tests := []struct {
+		name     string
+		left     variationMap
+		right    variationMap
+		mutators []string
+		want     bool
+	}{
+		{
+			name:     "equal projection ignores other mutators",
+			left:     variationMap{variations: map[string]string{"arch": "arm64", "link": "shared"}},
+			right:    variationMap{variations: map[string]string{"arch": "arm64", "link": "static"}},
+			mutators: []string{"arch"},
+			want:     true,
+		},
+		{
+			name:     "different projected values",
+			left:     variationMap{variations: map[string]string{"arch": "arm64"}},
+			right:    variationMap{variations: map[string]string{"arch": "arm"}},
+			mutators: []string{"arch"},
+			want:     false,
+		},
+		{
+			name:     "missing projected value",
+			left:     variationMap{variations: map[string]string{}},
+			right:    variationMap{variations: map[string]string{"arch": "arm64"}},
+			mutators: []string{"arch"},
+			want:     false,
+		},
+		{
+			name:     "empty projection",
+			left:     variationMap{variations: map[string]string{"arch": "arm64"}},
+			right:    variationMap{variations: map[string]string{"arch": "arm"}},
+			mutators: nil,
+			want:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.left.equalMatching(tt.right, tt.mutators); got != tt.want {
+				t.Fatalf("equalMatching() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUpdateDependenciesForModulesMatchesFullRebuild(t *testing.T) {
+	groupA := &moduleGroup{name: "a", index: 0}
+	groupB := &moduleGroup{name: "b", index: 1}
+	a := &moduleInfo{group: groupA}
+	b := &moduleInfo{group: groupA}
+	c := &moduleInfo{group: groupA}
+	x := &moduleInfo{group: groupB}
+	y := &moduleInfo{group: groupB}
+	groupA.modules = moduleList{a, b, c}
+	groupB.modules = moduleList{x, y}
+	a.directDeps = []depInfo{{module: x}}
+	b.directDeps = []depInfo{{module: a}}
+	c.directDeps = []depInfo{{module: y}}
+
+	ctx := NewContext()
+	ctx.moduleGroups = []*moduleGroup{groupA, groupB}
+	if errs := ctx.updateDependencies(); len(errs) != 0 {
+		t.Fatalf("initial updateDependencies() errors = %v", errs)
+	}
+
+	// Model a transition split that inserts a variant and changes one
+	// dependency, then a dependency replacement on another module.
+	newVariant := &moduleInfo{group: groupA, directDeps: slices.Clone(a.directDeps)}
+	groupA.modules = slices.Insert(groupA.modules, 1, newVariant)
+	c.directDeps[0].module = x
+	ctx.updateDependenciesForModules([]*moduleInfo{a, newVariant, b, c})
+
+	modules := []*moduleInfo{a, newVariant, b, c, x, y}
+	forwardAfterLocal := make(map[*moduleInfo][]*moduleInfo, len(modules))
+	reverseAfterLocal := make(map[*moduleInfo][]*moduleInfo, len(modules))
+	for _, module := range modules {
+		forwardAfterLocal[module] = slices.Clone(module.forwardDeps)
+		reverseAfterLocal[module] = slices.Clone(module.reverseDeps)
+	}
+	if errs := ctx.updateDependencies(); len(errs) != 0 {
+		t.Fatalf("reference updateDependencies() errors = %v", errs)
+	}
+	for _, module := range modules {
+		if !slices.Equal(module.forwardDeps, forwardAfterLocal[module]) {
+			t.Errorf("module %p forward dependencies differ: local %v, full %v", module, forwardAfterLocal[module], module.forwardDeps)
+		}
+		if !slices.Equal(module.reverseDeps, reverseAfterLocal[module]) {
+			t.Errorf("module %p reverse dependencies differ: local %v, full %v", module, reverseAfterLocal[module], module.reverseDeps)
+		}
+	}
+}
+
+func TestUpdateReverseDepsForNewDirectDepsPreservesGraphOrder(t *testing.T) {
+	groupA := &moduleGroup{index: 0}
+	groupB := &moduleGroup{index: 1}
+	target := &moduleInfo{group: &moduleGroup{index: 2}}
+	a1 := &moduleInfo{group: groupA, newDirectDeps: []*moduleInfo{target}}
+	a2 := &moduleInfo{group: groupA, newDirectDeps: []*moduleInfo{target}}
+	b := &moduleInfo{group: groupB, newDirectDeps: []*moduleInfo{target}}
+	groupA.modules = moduleList{a1, a2}
+	groupB.modules = moduleList{b}
+
+	updateReverseDepsForNewDirectDeps([]*moduleInfo{b, a2, a1})
+
+	if !slices.Equal(target.reverseDeps, []*moduleInfo{a1, a2, b}) {
+		t.Fatalf("reverseDeps = %v, want modules in graph order [a1 a2 b]", target.reverseDeps)
+	}
+	for _, module := range []*moduleInfo{a1, a2, b} {
+		if len(module.newDirectDeps) != 0 {
+			t.Errorf("module %p newDirectDeps = %v, want cleared", module, module.newDirectDeps)
+		}
+	}
+}
+
+func TestUpdateSplitVariantReferencesRepairsOnlyAffectedModules(t *testing.T) {
+	sourceGroup := &moduleGroup{index: 0}
+	dependentGroup := &moduleGroup{index: 1}
+	newDepGroup := &moduleGroup{index: 2}
+	createdGroup := &moduleGroup{index: 3}
+	targetGroup := &moduleGroup{index: 4}
+	source := &moduleInfo{group: sourceGroup}
+	dependent := &moduleInfo{group: dependentGroup, directDeps: []depInfo{{module: source}}}
+	newDependent := &moduleInfo{group: newDepGroup}
+	created := &moduleInfo{group: createdGroup, createdBy: source}
+	target := &moduleInfo{group: targetGroup}
+	sourceGroup.modules = moduleList{source}
+	dependentGroup.modules = moduleList{dependent}
+	newDepGroup.modules = moduleList{newDependent}
+	createdGroup.modules = moduleList{created}
+	targetGroup.modules = moduleList{target}
+	source.directDeps = []depInfo{{module: target}}
+
+	ctx := NewContext()
+	ctx.moduleGroups = []*moduleGroup{sourceGroup, dependentGroup, newDepGroup, createdGroup, targetGroup}
+	ctx.createdModuleGroups[source] = []*moduleGroup{createdGroup}
+	if errs := ctx.updateDependencies(); len(errs) != 0 {
+		t.Fatalf("initial updateDependencies() errors = %v", errs)
+	}
+	newDependent.directDeps = []depInfo{{module: source}}
+
+	first := &moduleInfo{group: sourceGroup, directDeps: slices.Clone(source.directDeps)}
+	second := &moduleInfo{group: sourceGroup, directDeps: slices.Clone(source.directDeps)}
+	source.obsoletedByNewVariants = true
+	source.splitModules = moduleList{first, second}
+	changedDependents := ctx.updateSplitVariantReferences([]*moduleInfo{source}, []*moduleInfo{newDependent})
+
+	if !slices.Equal(sourceGroup.modules, moduleList{first, second}) {
+		t.Fatalf("source variants = %v, want [first second]", sourceGroup.modules)
+	}
+	if dependent.directDeps[0].module != first {
+		t.Errorf("existing dependency = %p, want first variant %p", dependent.directDeps[0].module, first)
+	}
+	if newDependent.directDeps[0].module != first {
+		t.Errorf("new dependency = %p, want first variant %p", newDependent.directDeps[0].module, first)
+	}
+	if created.createdBy != first {
+		t.Errorf("createdBy = %p, want first variant %p", created.createdBy, first)
+	}
+	if !slices.Equal(changedDependents, []*moduleInfo{dependent, newDependent}) {
+		t.Errorf("changed dependents = %v, want [existing dependent, new dependent]", changedDependents)
+	}
+	if !slices.Contains(ctx.createdModuleGroups[first], createdGroup) {
+		t.Errorf("created child group was not reindexed under the first variant")
+	}
+	if slices.Contains(target.reverseDeps, source) {
+		t.Errorf("removed split source remains in dependency reverseDeps")
+	}
+	if len(source.forwardDeps) != 0 || len(source.reverseDeps) != 0 {
+		t.Errorf("removed split source retains graph edges: forward=%v reverse=%v", source.forwardDeps, source.reverseDeps)
+	}
+	ctx.updateDependenciesForModules(append(sourceGroup.modules, changedDependents...))
+	liveModules := []*moduleInfo{first, second, dependent, newDependent, created, target}
+	forwardAfterLocal := make(map[*moduleInfo][]*moduleInfo, len(liveModules))
+	reverseAfterLocal := make(map[*moduleInfo][]*moduleInfo, len(liveModules))
+	for _, module := range liveModules {
+		forwardAfterLocal[module] = slices.Clone(module.forwardDeps)
+		reverseAfterLocal[module] = slices.Clone(module.reverseDeps)
+	}
+	if errs := ctx.updateDependencies(); len(errs) != 0 {
+		t.Fatalf("reference updateDependencies() errors = %v", errs)
+	}
+	for _, module := range liveModules {
+		if !slices.Equal(module.forwardDeps, forwardAfterLocal[module]) {
+			t.Errorf("module %p forwardDeps = %v, want locally refreshed %v", module, module.forwardDeps, forwardAfterLocal[module])
+		}
+		if !slices.Equal(module.reverseDeps, reverseAfterLocal[module]) {
+			t.Errorf("module %p reverseDeps = %v, want locally refreshed %v", module, module.reverseDeps, reverseAfterLocal[module])
+		}
+	}
+
+	if errs := ctx.updateDependencies(); len(errs) != 0 {
+		t.Fatalf("updateDependencies() before a second split errors = %v", errs)
+	}
+	firstA := &moduleInfo{group: sourceGroup}
+	firstB := &moduleInfo{group: sourceGroup}
+	first.obsoletedByNewVariants = true
+	first.splitModules = moduleList{firstA, firstB}
+	ctx.updateSplitVariantReferences([]*moduleInfo{first}, nil)
+	if created.createdBy != firstA {
+		t.Errorf("createdBy after creator split again = %p, want first variant %p", created.createdBy, firstA)
+	}
+}
+
+func BenchmarkUpdateDependenciesForModules(b *testing.B) {
+	const (
+		groupCount       = 2048
+		modulesPerGroup  = 4
+		totalModuleCount = groupCount * modulesPerGroup
+	)
+
+	ctx := NewContext()
+	modules := make([]*moduleInfo, totalModuleCount)
+	for groupIndex := 0; groupIndex < groupCount; groupIndex++ {
+		group := &moduleGroup{name: strconv.Itoa(groupIndex), index: groupIndex}
+		group.modules = make(moduleList, modulesPerGroup)
+		for moduleIndex := range group.modules {
+			index := groupIndex*modulesPerGroup + moduleIndex
+			module := &moduleInfo{group: group}
+			group.modules[moduleIndex] = module
+			modules[index] = module
+		}
+		ctx.moduleGroups = append(ctx.moduleGroups, group)
+	}
+	for index, module := range modules {
+		module.directDeps = []depInfo{{module: modules[(index+modulesPerGroup+1)%totalModuleCount]}}
+	}
+	if errs := ctx.updateDependencies(); len(errs) != 0 {
+		b.Fatalf("initial updateDependencies() errors = %v", errs)
+	}
+	affected := slices.Clone(ctx.moduleGroups[groupCount/2].modules)
+
+	b.Run("full-graph", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			ctx.updateDependencies()
+		}
+	})
+	b.Run("one-module-group", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			ctx.updateDependenciesForModules(affected)
+		}
+	})
+}
+
 func Test_findVariant(t *testing.T) {
 	module := &moduleInfo{
 		variant: variant{
@@ -787,6 +1039,254 @@ func Test_findVariant(t *testing.T) {
 	}
 }
 
+func Test_findVariantCachesExactMatchesAndInvalidatesAfterVariantChanges(t *testing.T) {
+	group := &moduleGroup{name: "dep"}
+	for i := 0; i < 4; i++ {
+		module := &moduleInfo{
+			group: group,
+			variant: variant{
+				name:       fmt.Sprintf("v%d", i),
+				variations: variationMap{variations: map[string]string{"axis": fmt.Sprintf("v%d", i)}},
+			},
+		}
+		group.modules = append(group.modules, module)
+	}
+
+	source := &moduleInfo{variant: variant{variations: variationMap{}}}
+	ctx := NewContext()
+	find := func() *moduleInfo {
+		t.Helper()
+		module, _, errs := ctx.findVariant(nil, source, nil, group, []Variation{{Mutator: "axis", Variation: "v2"}}, false, false, -1)
+		if len(errs) > 0 {
+			t.Fatal(errs)
+		}
+		return module
+	}
+
+	if got, want := find(), group.modules[2]; got != want {
+		t.Fatalf("findVariant() = %p, want %p", got, want)
+	}
+	if len(group.exactVariantCache) != 1 {
+		t.Fatalf("exact variant cache has %d entries, want 1", len(group.exactVariantCache))
+	}
+
+	replacement := &moduleInfo{
+		group: group,
+		variant: variant{
+			name:       "v2-replacement",
+			variations: variationMap{variations: map[string]string{"axis": "v2"}},
+		},
+	}
+	group.modules[2] = replacement
+	group.invalidateVariantLookupCaches()
+	if got := find(); got != replacement {
+		t.Fatalf("findVariant() after cache invalidation = %p, want replacement %p", got, replacement)
+	}
+
+	missing, _, errs := ctx.findVariant(nil, source, nil, group, []Variation{{Mutator: "axis", Variation: "new"}}, false, false, -1)
+	if len(errs) > 0 || missing != nil {
+		t.Fatalf("findVariant() for missing exact variation = %p, errors %v; want nil", missing, errs)
+	}
+	newVariation := variationMap{variations: map[string]string{"axis": "new"}}
+	entries := group.exactVariantCache[newVariation.cacheHash()]
+	if len(entries) != 1 || !entries[0].variations.equal(newVariation) || entries[0].module != nil {
+		t.Fatal("missing exact variation was not cached")
+	}
+	added := &moduleInfo{
+		group: group,
+		variant: variant{
+			name:       "new",
+			variations: variationMap{variations: map[string]string{"axis": "new"}},
+		},
+	}
+	group.modules = append(group.modules, added)
+	group.invalidateVariantLookupCaches()
+	got, _, errs := ctx.findVariant(nil, source, nil, group, []Variation{{Mutator: "axis", Variation: "new"}}, false, false, -1)
+	if len(errs) > 0 || got != added {
+		t.Fatalf("findVariant() after adding variant = %p, errors %v; want %p", got, errs, added)
+	}
+}
+
+func TestModuleGroupProjectionAndFarLookupCachesInvalidate(t *testing.T) {
+	group := &moduleGroup{name: "dep"}
+	variants := []map[string]string{
+		{"arch": "arm64", "link": "shared"},
+		{"arch": "arm64", "link": "static"},
+		{"arch": "arm64", "image": "vendor"},
+		{"arch": "arm", "link": "shared"},
+	}
+	for i, variations := range variants {
+		module := &moduleInfo{
+			group: group,
+			variant: variant{
+				name:       fmt.Sprintf("v%d", i),
+				variations: variationMap{variations: variations},
+			},
+		}
+		group.modules = append(group.modules, module)
+	}
+
+	requested := variationMap{variations: map[string]string{"arch": "arm64"}}
+	if got, want := group.firstVariantMatching(requested, []string{"arch"}), group.modules[0]; got != want {
+		t.Fatalf("firstVariantMatching() = %p, want %p", got, want)
+	}
+	group.modules[0] = group.modules[3]
+	group.invalidateVariantLookupCaches()
+	if got, want := group.firstVariantMatching(requested, []string{"arch"}), group.modules[1]; got != want {
+		t.Fatalf("firstVariantMatching() after invalidation = %p, want %p", got, want)
+	}
+
+	if got, want := group.farVariant(requested), group.modules[1]; got != want {
+		t.Fatalf("farVariant() = %p, want %p", got, want)
+	}
+	added := &moduleInfo{
+		group: group,
+		variant: variant{
+			name:       "arm64-common",
+			variations: variationMap{variations: map[string]string{"arch": "arm64"}},
+		},
+	}
+	group.modules = append(group.modules, added)
+	group.invalidateVariantLookupCaches()
+	if got := group.farVariant(requested); got != added {
+		t.Fatalf("farVariant() after invalidation = %p, want %p", got, added)
+	}
+}
+
+func TestModuleGroupVariantLookupCacheIsBounded(t *testing.T) {
+	group := &moduleGroup{name: "dep"}
+	for i := 0; i < 4; i++ {
+		group.modules = append(group.modules, &moduleInfo{
+			group: group,
+			variant: variant{
+				variations: variationMap{variations: map[string]string{"arch": fmt.Sprintf("arch%d", i)}},
+			},
+		})
+	}
+	for i := 0; i < moduleGroupVariantLookupCacheLimit*2; i++ {
+		group.exactVariant(variationMap{variations: map[string]string{"arch": fmt.Sprintf("missing%d", i)}})
+	}
+	if group.variantLookupCacheSize != moduleGroupVariantLookupCacheLimit {
+		t.Fatalf("variant lookup cache retained %d entries, want limit %d", group.variantLookupCacheSize, moduleGroupVariantLookupCacheLimit)
+	}
+}
+
+func TestModuleGroupVariantLookupCachesSupportConcurrentReaders(t *testing.T) {
+	group := &moduleGroup{name: "dep"}
+	for i := 0; i < 8; i++ {
+		group.modules = append(group.modules, &moduleInfo{
+			group: group,
+			variant: variant{
+				name:       fmt.Sprintf("v%d", i),
+				variations: variationMap{variations: map[string]string{"arch": fmt.Sprintf("arch%d", i), "link": "shared"}},
+			},
+		})
+	}
+	exactQuery := variationMap{variations: map[string]string{"arch": "arch7", "link": "shared"}}
+	projectionQuery := variationMap{variations: map[string]string{"arch": "arch7"}}
+	var wait sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for j := 0; j < 100; j++ {
+				if group.exactVariant(exactQuery) != group.modules[7] {
+					t.Errorf("exact lookup returned a different variant")
+					return
+				}
+				if group.firstVariantMatching(projectionQuery, []string{"arch"}) != group.modules[7] {
+					t.Errorf("projected lookup returned a different variant")
+					return
+				}
+				if group.farVariant(projectionQuery) != group.modules[7] {
+					t.Errorf("far lookup returned a different variant")
+					return
+				}
+			}
+		}()
+	}
+	wait.Wait()
+}
+
+var benchmarkVariantResult *moduleInfo
+
+func BenchmarkModuleGroupVariantLookup(b *testing.B) {
+	group := &moduleGroup{name: "dep"}
+	for i := 0; i < 128; i++ {
+		module := &moduleInfo{
+			group: group,
+			variant: variant{
+				name:       fmt.Sprintf("v%d", i),
+				variations: variationMap{variations: map[string]string{"arch": fmt.Sprintf("arch%d", i), "link": "shared"}},
+			},
+		}
+		group.modules = append(group.modules, module)
+	}
+	query := variationMap{variations: map[string]string{"arch": "arch127", "link": "shared"}}
+
+	b.Run("linear", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			for _, module := range group.modules {
+				if module.variant.variations.equal(query) {
+					benchmarkVariantResult = module
+					break
+				}
+			}
+		}
+	})
+	b.Run("cached", func(b *testing.B) {
+		group.exactVariant(query)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			benchmarkVariantResult = group.exactVariant(query)
+		}
+	})
+	b.Run("projected-linear", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			for _, module := range group.modules {
+				if module.variant.variations.equalMatching(query, []string{"arch"}) {
+					benchmarkVariantResult = module
+					break
+				}
+			}
+		}
+	})
+	b.Run("projected-cached", func(b *testing.B) {
+		group.firstVariantMatching(query, []string{"arch"})
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			benchmarkVariantResult = group.firstVariantMatching(query, []string{"arch"})
+		}
+	})
+	b.Run("far-linear", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			var found *moduleInfo
+			bestDivergence := math.MaxInt
+			for _, module := range group.modules {
+				if query.subsetOf(module.variant.variations) {
+					divergence := module.variant.variations.differenceKeysCount(query)
+					if divergence < bestDivergence {
+						found = module
+						bestDivergence = divergence
+					}
+				}
+			}
+			benchmarkVariantResult = found
+		}
+	})
+	b.Run("far-cached", func(b *testing.B) {
+		farQuery := variationMap{variations: map[string]string{"arch": "arch127"}}
+		group.farVariant(farQuery)
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			benchmarkVariantResult = group.farVariant(farQuery)
+		}
+	})
+}
+
 func Test_parallelVisit(t *testing.T) {
 	addDep := func(from, to *moduleInfo) {
 		from.directDeps = append(from.directDeps, depInfo{to, nil})
@@ -847,6 +1347,35 @@ func Test_parallelVisit(t *testing.T) {
 		}
 		if g, w := order, "CBA"; g != w {
 			t.Errorf("expected order %q, got %q", w, g)
+		}
+	})
+	t.Run("subset visit keeps selected dependency ordering", func(t *testing.T) {
+		moduleC.waitingCount.Store(77)
+		for _, testCase := range []struct {
+			name  string
+			order visitOrderer
+			want  string
+		}{
+			{name: "bottom up", order: bottomUpVisitorImpl{}, want: "BA"},
+			{name: "top down", order: topDownVisitorImpl{}, want: "AB"},
+		} {
+			t.Run(testCase.name, func(t *testing.T) {
+				order := ""
+				errs := parallelVisitSubset([]*moduleInfo{moduleA, moduleB}, testCase.order, 1,
+					func(module *moduleInfo, _ pauseFunc) bool {
+						order += module.group.name
+						return false
+					})
+				if errs != nil {
+					t.Fatalf("unexpected errors: %v", errs)
+				}
+				if order != testCase.want {
+					t.Fatalf("visit order = %q, want %q", order, testCase.want)
+				}
+				if got := moduleC.waitingCount.Load(); got != 77 {
+					t.Fatalf("excluded dependency waitingCount = %d, want unchanged 77", got)
+				}
+			})
 		}
 	})
 	t.Run("pause", func(t *testing.T) {
@@ -1660,4 +2189,35 @@ func Benchmark_parallelVisit(b *testing.B) {
 	if errs != nil {
 		b.Errorf("expected no errors, got %q", errs)
 	}
+}
+
+func Benchmark_parallelVisitAllVsSubset(b *testing.B) {
+	const moduleCount = 16384
+	const subsetCount = 256
+
+	modules := make([]*moduleInfo, moduleCount)
+	for i := range modules {
+		module := &moduleInfo{group: &moduleGroup{name: strconv.Itoa(i)}}
+		module.group.modules = moduleList{module}
+		modules[i] = module
+	}
+	subset := slices.Clone(modules[:subsetCount])
+	visit := func(*moduleInfo, pauseFunc) bool { return false }
+
+	b.Run("all", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if errs := parallelVisit(slices.Values(modules), bottomUpVisitorImpl{}, 64, visit); len(errs) > 0 {
+				b.Fatal(errs)
+			}
+		}
+	})
+	b.Run("subset", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if errs := parallelVisitSubset(subset, bottomUpVisitorImpl{}, 64, visit); len(errs) > 0 {
+				b.Fatal(errs)
+			}
+		}
+	})
 }

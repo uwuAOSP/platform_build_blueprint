@@ -15,8 +15,13 @@
 package pathtools
 
 import (
+	"bufio"
+	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestOpenWithTruncateOnCloseTruncate(t *testing.T) {
@@ -74,6 +79,81 @@ func TestOpenWithTruncateOnCloseTruncate(t *testing.T) {
 			t.Run("os", func(t *testing.T) {
 				run(t, NewOsFs(os.TempDir()), test)
 			})
+		})
+	}
+}
+
+func TestOpenWithContentComparison(t *testing.T) {
+	largePrefix := strings.Repeat("same-prefix", 12*1024)
+	testCases := []struct {
+		name      string
+		initial   string
+		contents  []string
+		unchanged bool
+	}{
+		{name: "same", initial: "unchanged", contents: []string{"unchanged"}, unchanged: true},
+		{name: "large same", initial: largePrefix, contents: []string{largePrefix}, unchanged: true},
+		{name: "large suffix change", initial: largePrefix + "old", contents: []string{largePrefix + "new"}},
+		{name: "grow", initial: "old", contents: []string{"older"}},
+		{name: "shrink", initial: "longer", contents: []string{"short"}},
+		{name: "change", initial: "before", contents: []string{"after"}},
+		{name: "to empty", initial: "before", contents: []string{""}},
+		{name: "from empty", initial: "", contents: []string{"after"}},
+		{name: "create empty", contents: []string{""}},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "ninja")
+			if test.initial != "" || test.name == "from empty" {
+				if err := os.WriteFile(path, []byte(test.initial), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var initialInfo os.FileInfo
+			if info, err := os.Stat(path); err == nil {
+				initialInfo = info
+			}
+
+			writer, err := OpenWithContentComparison(OsFs, path)
+			if err != nil {
+				t.Fatalf("OpenWithContentComparison: %v", err)
+			}
+			buffered := bufio.NewWriter(writer)
+			for _, contents := range test.contents {
+				if _, err := io.WriteString(buffered, contents); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+			}
+			if err := buffered.Flush(); err != nil {
+				t.Fatalf("flush: %v", err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+			if got, want := writer.ContentChanged(), !test.unchanged; got != want {
+				t.Errorf("ContentChanged() = %t, want %t", got, want)
+			}
+			if !writer.ContentChanged() && writer.BytesWritten() != 0 {
+				t.Errorf("unchanged output wrote %d bytes", writer.BytesWritten())
+			}
+
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read output: %v", err)
+			}
+			if want := test.contents[len(test.contents)-1]; string(got) != want {
+				t.Fatalf("expected %q, got %q", want, got)
+			}
+			if test.unchanged {
+				time.Sleep(20 * time.Millisecond)
+				if info, err := os.Stat(path); err != nil {
+					t.Fatal(err)
+				} else if !info.ModTime().Equal(initialInfo.ModTime()) {
+					t.Errorf("unchanged output modified mtime: was %v, now %v", initialInfo.ModTime(), info.ModTime())
+				}
+			}
 		})
 	}
 }

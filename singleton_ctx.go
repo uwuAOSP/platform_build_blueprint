@@ -16,6 +16,7 @@ package blueprint
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/google/blueprint/pathtools"
 	"github.com/google/blueprint/proptools"
@@ -246,7 +247,43 @@ type singletonContext struct {
 
 	actionDefs localBuildActions
 
-	depProviders map[int]bool
+	depProviders                    map[int]bool
+	moduleDependencyBloom           []uint64
+	moduleProviderDependencyBitsets map[int][]uint64
+	moduleSetHash                   string
+	singletonSetHash                string
+	singletonProviderDependencies   []SingletonProviderDependency
+}
+
+func (s *singletonContext) recordModule(module *moduleInfo) {
+	if module == nil || !s.singleton.incrementalSupported || !s.context.incrementalEnabled {
+		return
+	}
+	if s.moduleDependencyBloom == nil {
+		words := s.context.incrementalModuleBloomWords
+		if words == 0 {
+			words = 1
+		}
+		s.moduleDependencyBloom = make([]uint64, words)
+	}
+	key, ok := s.context.incrementalModuleCacheKeyByInfo[module]
+	if !ok {
+		key = module.moduleCacheKey()
+	}
+	moduleDependencyBloomAdd(s.moduleDependencyBloom, key)
+}
+
+func (s *singletonContext) recordModuleSet() {
+	if s.singleton.incrementalSupported && s.context.incrementalEnabled {
+		s.moduleSetHash = s.context.incrementalModuleSetHash
+	}
+}
+
+func (s *singletonContext) recordSingletonSet() {
+	if !s.singleton.incrementalSupported || !s.context.incrementalEnabled {
+		return
+	}
+	s.singletonSetHash = s.context.finishedSingletonSetHash()
 }
 
 func (s *singletonContext) Config() interface{} {
@@ -258,24 +295,61 @@ func (s *singletonContext) Name() string {
 }
 
 func (s *singletonContext) ModuleName(logicModule ModuleOrProxy) string {
+	s.recordModuleSet()
 	return s.context.ModuleName(logicModule)
 }
 
 func (s *singletonContext) ModuleDir(logicModule ModuleOrProxy) string {
+	s.recordModuleSet()
 	return s.context.ModuleDir(logicModule)
 }
 
 func (s *singletonContext) ModuleSubDir(logicModule ModuleOrProxy) string {
+	s.recordModuleSet()
 	return s.context.ModuleSubDir(logicModule)
 }
 
 func (s *singletonContext) ModuleType(logicModule ModuleOrProxy) string {
+	s.recordModuleSet()
 	return s.context.ModuleType(logicModule)
 }
 
 func (s *singletonContext) ModuleProvider(logicModule ModuleOrProxy, provider AnyProviderKey) (any, bool) {
-	s.depProviders[provider.provider().id] = true
+	providerId := provider.provider().id
+	s.depProviders[providerId] = true
+	if s.singleton.incrementalSupported && s.context.incrementalEnabled {
+		s.recordModuleSet()
+		if s.moduleProviderDependencyBitsets == nil {
+			s.moduleProviderDependencyBitsets = make(map[int][]uint64)
+		}
+		bitset := s.moduleProviderDependencyBitsets[providerId]
+		if bitset == nil {
+			words := s.context.incrementalModuleBitsetWords
+			if words == 0 {
+				words = 1
+			}
+			bitset = make([]uint64, words)
+			s.moduleProviderDependencyBitsets[providerId] = bitset
+		}
+		if moduleIndex, ok := s.context.incrementalModuleIndexByInfo[logicModule.info()]; ok {
+			bitset[moduleIndex/64] |= uint64(1) << (moduleIndex % 64)
+		}
+	}
 	return s.context.ModuleProvider(logicModule, provider)
+}
+
+func (s *singletonContext) cachedModuleProviderDependencyBitsets() []ModuleProviderDependencyBitset {
+	if len(s.moduleProviderDependencyBitsets) == 0 {
+		return nil
+	}
+	result := make([]ModuleProviderDependencyBitset, 0, len(s.moduleProviderDependencyBitsets))
+	for providerId, modules := range s.moduleProviderDependencyBitsets {
+		result = append(result, ModuleProviderDependencyBitset{ProviderId: providerId, Modules: modules})
+	}
+	slices.SortFunc(result, func(a, b ModuleProviderDependencyBitset) int {
+		return a.ProviderId - b.ProviderId
+	})
+	return result
 }
 
 func (s *singletonContext) SetSingletonProvider(provider AnyProviderKey, value any) {
@@ -283,11 +357,23 @@ func (s *singletonContext) SetSingletonProvider(provider AnyProviderKey, value a
 }
 
 func (s *singletonContext) OtherSingletonProvider(singleton SingletonProxy, provider AnyProviderKey) (any, bool) {
-	s.depProviders[provider.provider().id] = true
-	return s.context.singletonProvider(singleton.singleton, provider.provider())
+	providerKey := provider.provider()
+	s.depProviders[providerKey.id] = true
+	value, found := s.context.singletonProvider(singleton.singleton, providerKey)
+	hash := proptools.ZeroHash
+	if providerKey.id < len(singleton.singleton.providerInitialValueHashes) {
+		hash = singleton.singleton.providerInitialValueHashes[providerKey.id]
+	}
+	s.singletonProviderDependencies = append(s.singletonProviderDependencies, SingletonProviderDependency{
+		SingletonName: singleton.singleton.name,
+		ProviderId:    providerKey.id,
+		Hash:          hash,
+	})
+	return value, found
 }
 
 func (s *singletonContext) BlueprintFile(logicModule ModuleOrProxy) string {
+	s.recordModuleSet()
 	return s.context.BlueprintFile(logicModule)
 }
 
@@ -300,6 +386,7 @@ func (s *singletonContext) error(err error) {
 func (s *singletonContext) ModuleErrorf(logicModule ModuleOrProxy, format string,
 	args ...interface{}) {
 
+	s.recordModule(logicModule.info())
 	s.error(s.context.ModuleErrorf(logicModule, format, args...))
 }
 
@@ -311,6 +398,7 @@ func (s *singletonContext) Errorf(format string, args ...interface{}) {
 func (s *singletonContext) OtherModulePropertyErrorf(logicModule ModuleOrProxy, property string, format string,
 	args ...interface{}) {
 
+	s.recordModule(logicModule.info())
 	s.error(s.context.PropertyErrorf(logicModule, property, format, args...))
 }
 
@@ -395,24 +483,40 @@ func (s *singletonContext) AddSubninja(file string) {
 }
 
 func (s *singletonContext) VisitAllModules(visit func(Module)) {
-	s.context.VisitAllModules(visit)
+	s.recordModuleSet()
+	s.context.VisitAllModules(func(module Module) {
+		s.recordModule(module.info())
+		visit(module)
+	})
 }
 
 func (s *singletonContext) VisitAllModulesOrProxies(visit func(ModuleOrProxy)) {
-	s.context.VisitAllModulesOrProxies(visit)
+	s.recordModuleSet()
+	s.context.VisitAllModulesOrProxies(func(module ModuleOrProxy) {
+		if _, isModule := module.(Module); isModule {
+			s.recordModule(module.info())
+		}
+		visit(module)
+	})
 }
 
 func (s *singletonContext) VisitAllModuleProxies(visit func(proxy ModuleProxy)) {
+	s.recordModuleSet()
 	s.context.VisitAllModulesProxies(visit)
 }
 
 func (s *singletonContext) VisitAllModulesIf(pred func(Module) bool,
 	visit func(Module)) {
 
-	s.context.VisitAllModulesIf(pred, visit)
+	s.recordModuleSet()
+	s.context.VisitAllModulesIf(func(module Module) bool {
+		s.recordModule(module.info())
+		return pred(module)
+	}, visit)
 }
 
 func (s *singletonContext) VisitDirectDeps(module Module, visit func(Module)) {
+	s.recordModule(module.info())
 	topModule := module.info()
 
 	defer func() {
@@ -423,6 +527,7 @@ func (s *singletonContext) VisitDirectDeps(module Module, visit func(Module)) {
 	}()
 
 	for _, dep := range topModule.directDeps {
+		s.recordModule(dep.module)
 		s.visitingDep = dep
 		if dep.module.logicModule == nil {
 			panic(fmt.Errorf("VisitDirectDeps visited module %s that called FreeAfterGenerateBuildActions()", dep.module))
@@ -432,6 +537,7 @@ func (s *singletonContext) VisitDirectDeps(module Module, visit func(Module)) {
 }
 
 func (s *singletonContext) VisitDirectDepsIf(module Module, pred func(Module) bool, visit func(Module)) {
+	s.recordModule(module.info())
 	topModule := module.info()
 
 	defer func() {
@@ -442,6 +548,7 @@ func (s *singletonContext) VisitDirectDepsIf(module Module, pred func(Module) bo
 	}()
 
 	for _, dep := range topModule.directDeps {
+		s.recordModule(dep.module)
 		s.visitingDep = dep
 		if dep.module.logicModule == nil {
 			panic(fmt.Errorf("VisitDirectDepsIf visited module %s that called FreeAfterGenerateBuildActions()", dep.module))
@@ -453,6 +560,7 @@ func (s *singletonContext) VisitDirectDepsIf(module Module, pred func(Module) bo
 }
 
 func (s *singletonContext) VisitDirectDepsProxies(module ModuleProxy, visit func(ModuleProxy)) {
+	s.recordModule(module.info())
 	topModule := module.info()
 
 	defer func() {
@@ -469,6 +577,7 @@ func (s *singletonContext) VisitDirectDepsProxies(module ModuleProxy, visit func
 }
 
 func (s *singletonContext) OtherModuleDependencyTag(module ModuleOrProxy) DependencyTag {
+	s.recordModuleSet()
 	if s.visitingDep.module == module.info() {
 		return s.visitingDep.tag
 	}
@@ -476,33 +585,44 @@ func (s *singletonContext) OtherModuleDependencyTag(module ModuleOrProxy) Depend
 }
 
 func (s *singletonContext) PrimaryModule(module Module) Module {
+	s.recordModuleSet()
 	return s.context.PrimaryModule(module)
 }
 
 func (s *singletonContext) PrimaryModuleProxy(module ModuleProxy) ModuleProxy {
+	s.recordModuleSet()
 	return ModuleProxy{s.context.primaryModule(module.info())}
 }
 
 func (s *singletonContext) IsPrimaryModule(module ModuleOrProxy) bool {
+	s.recordModuleSet()
 	return s.context.IsPrimaryModule(module)
 }
 
 func (s *singletonContext) IsFinalModule(module ModuleOrProxy) bool {
+	s.recordModuleSet()
 	return s.context.IsFinalModule(module)
 }
 
 func (s *singletonContext) VisitAllModuleVariants(module Module, visit func(Module)) {
-	s.context.VisitAllModuleVariants(module, visit)
+	s.recordModule(module.info())
+	s.recordModuleSet()
+	s.context.VisitAllModuleVariants(module, func(variant Module) {
+		s.recordModule(variant.info())
+		visit(variant)
+	})
 }
 
 func (s *singletonContext) VisitAllModuleVariantProxies(module ModuleProxy, visit func(proxy ModuleProxy)) {
-	s.context.VisitAllModuleVariantProxies(module, visitProxyAdaptor(visit))
+	s.recordModuleSet()
+	s.context.VisitAllModuleVariantProxies(module, visit)
 }
 
 func (s *singletonContext) VisitAllSingletons(visit func(singleton SingletonProxy)) {
 	if s.singleton.parallel {
 		panic(fmt.Sprintf("VisitAllSingletons not allowed in parallel singletons %s", s.Name()))
 	}
+	s.recordSingletonSet()
 	s.context.VisitAllSingletons(visit)
 }
 
@@ -532,6 +652,7 @@ func (s *singletonContext) Fs() pathtools.FileSystem {
 
 func (s *singletonContext) ModuleVariantsFromName(referer ModuleProxy, name string) []ModuleProxy {
 	c := s.context
+	s.recordModuleSet()
 
 	refererInfo := referer.info()
 	if refererInfo == nil {
@@ -554,12 +675,6 @@ func (s *singletonContext) HasMutatorFinished(mutatorName string) bool {
 	return s.context.HasMutatorFinished(mutatorName)
 }
 
-func visitProxyAdaptor(visit func(proxy ModuleProxy)) func(module ModuleProxy) {
-	return func(module ModuleProxy) {
-		visit(ModuleProxy{module.info()})
-	}
-}
-
 func (s *singletonContext) GetIncrementalAnalysis() bool {
 	return s.context.GetIncrementalAnalysis()
 }
@@ -569,9 +684,12 @@ func (s *singletonContext) GetIncrementalEnabled() bool {
 }
 
 func (s *singletonContext) OtherModuleNamespace(module ModuleOrProxy) Namespace {
+	s.recordModuleSet()
 	return s.context.nameInterface.GetNamespace(newNamespaceContext(module.info()))
 }
 
 func (s *singletonContext) GetModuleProxy(moduleName string, variant []Variation) ModuleProxy {
-	return ModuleProxy{s.context.getModule(moduleName, variant)}
+	s.recordModuleSet()
+	module := s.context.getModule(moduleName, variant)
+	return ModuleProxy{module}
 }

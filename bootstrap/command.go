@@ -27,6 +27,7 @@ import (
 	"strings"
 
 	"github.com/google/blueprint"
+	"github.com/google/blueprint/pathtools"
 	"github.com/google/blueprint/proptools"
 )
 
@@ -42,11 +43,18 @@ type Args struct {
 	TraceFile  string
 
 	// Debug data json file
-	ModuleDebugFile         string
-	IncrementalBuildActions bool
+	ModuleDebugFile            string
+	IncrementalBuildActions    bool
+	IncrementalDebugMissesOnly bool
+	// ShardNinja enables reusable module and singleton Ninja shards for uni.
+	ShardNinja              bool
 	IncrementalProviderTest bool
 	IncrementalDebugFile    string
 	PartialAnalysisTargets  string
+}
+
+func useUniNinjaShards(args Args) bool {
+	return args.ShardNinja && !args.EmptyNinjaFile && !strings.Contains(args.OutFile, "bootstrap.ninja")
 }
 
 // RegisterGoModuleTypes adds module types to build tools written in golang
@@ -131,6 +139,9 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 		ctx.EndEvent("parse_bp")
 		ninjaDeps = append(ninjaDeps, blueprintFiles...)
 	}
+	if err := ctx.PrepareIncrementalAnalysis(); err != nil {
+		return nil, colorizeErrs([]error{err})
+	}
 
 	if resolvedDeps, errs := ctx.ResolveDependencies(config); len(errs) > 0 {
 		return nil, colorizeErrs(errs)
@@ -190,7 +201,13 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 		}
 		out = io.Discard.(blueprint.StringWriterWriter)
 	} else {
-		f, err := os.OpenFile(blueprint.JoinPath(ctx.SrcDir(), args.OutFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, blueprint.OutFilePermissions)
+		var f io.WriteCloser
+		var err error
+		if useUniNinjaShards(args) {
+			f, err = pathtools.OpenWithContentComparison(pathtools.OsFs, blueprint.JoinPath(ctx.SrcDir(), args.OutFile))
+		} else {
+			f, err = os.OpenFile(blueprint.JoinPath(ctx.SrcDir(), args.OutFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, blueprint.OutFilePermissions)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("error opening Ninja file: %s", err)
 		}
@@ -199,7 +216,7 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 		out = buf
 	}
 
-	if err := ctx.WriteBuildFile(out, !strings.Contains(args.OutFile, "bootstrap.ninja") && !args.EmptyNinjaFile, args.OutFile); err != nil {
+	if err := ctx.WriteBuildFile(out, useUniNinjaShards(args), args.OutFile); err != nil {
 		return nil, fmt.Errorf("error writing Ninja file contents: %s", err)
 	}
 

@@ -56,6 +56,26 @@ func (t *testConfig) ActionSandboxMetrics() *blueprint.SandboxMetrics {
 
 var _ BootstrapConfig = &testConfig{}
 
+func TestUseUniNinjaShards(t *testing.T) {
+	tests := []struct {
+		name string
+		args Args
+		want bool
+	}{
+		{name: "traditional Soong graph", args: Args{OutFile: "build.product.ninja"}},
+		{name: "uni Soong graph", args: Args{OutFile: "build.product.ninja", ShardNinja: true}, want: true},
+		{name: "bootstrap graph", args: Args{OutFile: "bootstrap.ninja", ShardNinja: true}},
+		{name: "empty graph", args: Args{OutFile: "build.product.ninja", ShardNinja: true, EmptyNinjaFile: true}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := useUniNinjaShards(test.args); got != test.want {
+				t.Fatalf("useUniNinjaShards(%+v) = %t, want %t", test.args, got, test.want)
+			}
+		})
+	}
+}
+
 func TestBootstrap(t *testing.T) {
 	ctx := blueprint.NewContext()
 	ctx.CaptureBuildParams()

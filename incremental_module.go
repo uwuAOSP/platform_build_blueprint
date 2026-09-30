@@ -55,6 +55,10 @@ func (m *moduleInfo) restoreModuleBuildActions(ctx *Context) bool {
 		// Don't restore, incremental analysis is not enabled.
 		return false
 	}
+	if _, optedOut := m.logicModule.(ModuleActionCacheOptOut); optedOut {
+		m.incrementalRestoreReason = "module_action_cache_opt_out"
+		return false
+	}
 
 	// Compute the hashes of the input data.
 	hash, err := proptools.CalculateHashReflection(m.properties)
@@ -89,13 +93,18 @@ func (m *moduleInfo) restoreModuleBuildActions(ctx *Context) bool {
 	m.buildActionInputHash = hash
 
 	if ctx.incrementalDebugFile != "" {
-		m.incrementalDebugInfo = m.incrementalDebugData(cacheInput)
+		defer func() {
+			if !ctx.incrementalDebugMissesOnly || !m.incrementalRestored {
+				m.incrementalDebugInfo = m.incrementalDebugData(cacheInput)
+			}
+		}()
 	}
 
 	if !ctx.GetIncrementalAnalysis() {
 		// Don't restore, incremental analysis is globally disabled (for example
 		// because no cache is present, TARGET_PRODUCT was changed, or soong_build
 		// was rebuilt).
+		m.incrementalRestoreReason = "incremental_analysis_disabled"
 		return false
 	}
 
@@ -104,8 +113,14 @@ func (m *moduleInfo) restoreModuleBuildActions(ctx *Context) bool {
 	if err != nil {
 		panic(err)
 	}
-	if data == nil || m.buildActionInputHash != data.InputHash {
+	if data == nil {
 		// Don't restore, no cache entry or the input hash doesn't match.
+		m.incrementalRestoreReason = "cache_entry_missing"
+		return false
+	}
+	if m.buildActionInputHash != data.InputHash {
+		m.cachePreviousProviderHashes(data)
+		m.incrementalRestoreReason = "module_or_dependency_inputs_changed"
 		return false
 	}
 	for _, glob := range data.GlobCache {
@@ -119,9 +134,12 @@ func (m *moduleInfo) restoreModuleBuildActions(ctx *Context) bool {
 		}
 		if hash != glob.Result {
 			// Don't restore, a glob result has changed.
+			m.cachePreviousProviderHashes(data)
+			m.incrementalRestoreReason = "glob_result_changed: " + glob.Pattern
 			return false
 		}
 	}
+	m.globCache = data.GlobCache
 
 	// Restore the module from the cache.
 	if m.providerInitialValueHashes == nil {
@@ -130,6 +148,7 @@ func (m *moduleInfo) restoreModuleBuildActions(ctx *Context) bool {
 
 	m.hasUnrestoredProvider = make([]bool, len(providerRegistry))
 	m.incrementalRestored = true
+	m.incrementalRestoreReason = "cache_hit"
 
 	for _, provider := range data.ProviderHashes {
 		m.providerInitialValueHashes[provider.Id.id] = provider.Hash
@@ -168,6 +187,16 @@ func (m *moduleInfo) restoreModuleBuildActions(ctx *Context) bool {
 	return true
 }
 
+func (m *moduleInfo) cachePreviousProviderHashes(data *ModuleActionCachedData) {
+	m.cachedProviderInitialValueHashes = make([]proptools.Hash, len(providerRegistry))
+	for _, provider := range data.ProviderHashes {
+		if provider.Id != nil && provider.Id.id >= 0 && provider.Id.id < len(m.cachedProviderInitialValueHashes) {
+			m.cachedProviderInitialValueHashes[provider.Id.id] = provider.Hash
+		}
+	}
+	m.hasCachedProviderInitialValueHashes = true
+}
+
 // @auto-generate: gob
 type hashList []proptools.Hash
 
@@ -196,6 +225,10 @@ func (m *moduleInfo) calculateProviderHash() {
 }
 
 func (m *moduleInfo) cacheModuleBuildActions(ctx gobtools.EncContext, buildActionsCache *KeyValueStoreCache) {
+	if _, optedOut := m.logicModule.(ModuleActionCacheOptOut); optedOut {
+		return
+	}
+
 	var providerHashes []ProviderHash
 
 	for i, p := range m.providers {
@@ -238,18 +271,20 @@ type depProviders struct {
 
 func (m *moduleInfo) incrementalDebugData(inputHash *ModuleBuildActionCacheInput) []byte {
 	info := struct {
-		Name      string         `json:"name"`
-		CacheKey  string         `json:"cache_key"`
-		Type      string         `json:"type"`
-		Variant   string         `json:"variant"`
-		PropHash  proptools.Hash `json:"properties_hash"`
-		Providers []depProviders `json:"providers"`
+		Name          string         `json:"name"`
+		CacheKey      string         `json:"cache_key"`
+		Type          string         `json:"type"`
+		Variant       string         `json:"variant"`
+		PropHash      proptools.Hash `json:"properties_hash"`
+		RestoreReason string         `json:"restore_reason"`
+		Providers     []depProviders `json:"providers"`
 	}{
-		Name:     m.logicModule.Name(),
-		CacheKey: m.moduleCacheKey(),
-		Type:     m.typeName,
-		Variant:  m.variant.name,
-		PropHash: inputHash.PropertiesHash,
+		Name:          m.logicModule.Name(),
+		CacheKey:      m.moduleCacheKey(),
+		Type:          m.typeName,
+		Variant:       m.variant.name,
+		PropHash:      inputHash.PropertiesHash,
+		RestoreReason: m.incrementalRestoreReason,
 		Providers: func() []depProviders {
 			result := make([]depProviders, 0, len(m.directDeps))
 			for _, d := range m.directDeps {

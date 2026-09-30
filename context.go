@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,6 +43,7 @@ import (
 	"sync/atomic"
 	"text/scanner"
 	"text/template"
+	"time"
 	"unsafe"
 
 	"github.com/google/blueprint/gobtools"
@@ -144,18 +146,22 @@ type Context struct {
 	context.Context
 
 	// Used for metrics-related event logging.
-	EventHandler *metrics.EventHandler
+	EventHandler      *metrics.EventHandler
 	eventStartedHook  func(string)
 	eventProgressHook func(string, int, int)
 
 	BeforePrepareBuildActionsHook func() error
 
-	moduleFactories     map[string]ModuleFactory
-	nameInterface       NameInterface
-	moduleGroups        []*moduleGroup
-	singletonInfo       []*singletonInfo
-	mutatorInfo         []*mutatorInfo
-	variantMutatorNames []string
+	moduleFactories          map[string]ModuleFactory
+	nameInterface            NameInterface
+	moduleGroups             []*moduleGroup
+	moduleGroupsBySource     map[string][]*moduleGroup
+	createdModuleGroups      map[*moduleInfo][]*moduleGroup
+	singletonInfo            []*singletonInfo
+	mutatorInfo              []*mutatorInfo
+	mutatorVisitStatsEnabled bool
+	mutatorVisitStats        map[string]MutatorVisitStats
+	variantMutatorNames      []string
 
 	completedTransitionMutators int
 	transitionMutators          []*transitionMutatorImpl
@@ -237,13 +243,37 @@ type Context struct {
 
 	incrementalProviderTest bool
 
-	keyValueStoreCache      *KeyValueStoreCache
-	buildActionsToCacheLock sync.Mutex
-	orderOnlyStringsCache   OrderOnlyStringsCache
-	orderOnlyStrings        syncmap.SyncMap[uniquelist.UniqueList[string], *orderOnlyStringsInfo]
-	incrementalDebugFile    string
-	EncContext              gobtools.EncContext
-	providerValueHashes     []proptools.Hash
+	keyValueStoreCache                  *KeyValueStoreCache
+	incrementalAnalysisPrepared         bool
+	buildActionsToCacheLock             sync.Mutex
+	orderOnlyStringsCache               OrderOnlyStringsCache
+	orderOnlyStrings                    syncmap.SyncMap[uniquelist.UniqueList[string], *orderOnlyStringsInfo]
+	incrementalDebugFile                string
+	incrementalDebugMissesOnly          bool
+	EncContext                          gobtools.EncContext
+	incrementalChangedModuleCacheKeys   []string
+	incrementalChangedModuleProviders   []moduleProviderDependency
+	sourceModuleDeclarations            map[string]proptools.Hash
+	changedSourceModuleDeclarations     []string
+	addedSourceModuleDeclarations       []string
+	removedSourceModuleDeclarations     []string
+	affectedSourceModuleDeclarations    []string
+	affectedModuleCacheKeys             []string
+	sourceDeclarationGraphValid         bool
+	sourceDeclarationGraphComplete      bool
+	sourceDeclarationSnapshotValid      bool
+	sourceDeclarationFileIndex          *SourceDeclarationFileIndex
+	sourceDeclarationFileSnapshots      map[string]*SourceModuleDeclarationFileSnapshot
+	sourceDeclarationModuleCacheKeys    map[string][]string
+	sourceDeclarationDependents         map[string][]string
+	sourceDeclarationGlobs              map[string][]globResultCache
+	previousSourceDeclarationDependents map[string][]string
+	incrementalModuleCacheKeyByInfo     map[*moduleInfo]string
+	incrementalModuleIndexByInfo        map[*moduleInfo]int
+	incrementalModuleIndexByCacheKey    map[string]int
+	incrementalModuleSetHash            string
+	incrementalModuleBloomWords         int
+	incrementalModuleBitsetWords        int
 
 	moduleDebugDataChannel chan []byte
 
@@ -338,6 +368,29 @@ func (c *Context) iterateAllVariants() iter.Seq[*moduleInfo] {
 	}
 }
 
+// modulesForSourceDeclarations returns the variants belonging to the selected
+// source declarations without scanning variants for unrelated module groups.
+// Source-less groups are always included because they have no declaration key
+// to participate in the invalidation set.
+func (c *Context) modulesForSourceDeclarations(sourceKeys []string) []*moduleInfo {
+	groups := make(map[*moduleGroup]struct{})
+	groupsToVisit := make([]*moduleGroup, 0)
+	for _, sourceKey := range append(slices.Clone(sourceKeys), "") {
+		for _, group := range c.moduleGroupsBySource[sourceKey] {
+			if _, exists := groups[group]; exists {
+				continue
+			}
+			groups[group] = struct{}{}
+			groupsToVisit = append(groupsToVisit, group)
+		}
+	}
+	modules := make([]*moduleInfo, 0)
+	for _, group := range groupsToVisit {
+		modules = append(modules, group.modules...)
+	}
+	return modules
+}
+
 // An Error describes a problem that was encountered that is related to a
 // particular location in a Blueprints file.
 type BlueprintError struct {
@@ -395,8 +448,21 @@ func (l moduleList) lastModule() *moduleInfo {
 
 type moduleGroup struct {
 	name string
+	// sourceDeclarationKey identifies the Blueprint declaration that produced
+	// this module group, including groups created by module-local mutators.
+	sourceDeclarationKey string
+	// index is the stable position in Context.moduleGroups, used to preserve
+	// graph update ordering without rescanning every module group.
+	index int
 
 	modules moduleList
+
+	variantLookupCacheLock sync.RWMutex
+	variantLookupCacheSize int
+	variantNameCache       map[string]*moduleInfo
+	exactVariantCache      map[uint64][]exactVariantCacheEntry
+	projectedVariantCache  map[uint64][]projectedVariantCacheEntry
+	farVariantCache        map[uint64][]farVariantCacheEntry
 
 	namespace Namespace
 
@@ -419,13 +485,239 @@ type moduleGroup struct {
 	passive bool
 }
 
+type exactVariantCacheEntry struct {
+	variations variationMap
+	module     *moduleInfo
+}
+
+type projectedVariantCacheEntry struct {
+	variations variationMap
+	mutators   []string
+	module     *moduleInfo
+}
+
+type farVariantCacheEntry struct {
+	variations variationMap
+	module     *moduleInfo
+}
+
+// A short scan is cheaper than a lock and cache lookup for small variant groups.
+const moduleGroupVariantLookupIndexThreshold = 4
+
+// Bound per-group query snapshots so unusual graphs cannot grow this cache without limit.
+const moduleGroupVariantLookupCacheLimit = 32
+
 func (group *moduleGroup) moduleByVariantName(name string) *moduleInfo {
-	for _, module := range group.modules {
-		if module.variant.name == name {
+	if len(group.modules) >= moduleGroupVariantLookupIndexThreshold {
+		group.variantLookupCacheLock.RLock()
+		module, ok := group.variantNameCache[name]
+		group.variantLookupCacheLock.RUnlock()
+		if ok {
 			return module
 		}
 	}
+
+	for _, module := range group.modules {
+		if module.variant.name == name {
+			if len(group.modules) >= moduleGroupVariantLookupIndexThreshold {
+				group.variantLookupCacheLock.Lock()
+				if group.variantNameCache == nil {
+					group.variantNameCache = make(map[string]*moduleInfo)
+				}
+				if len(group.variantNameCache) < moduleGroupVariantLookupCacheLimit {
+					group.variantNameCache[name] = module
+				}
+				group.variantLookupCacheLock.Unlock()
+			}
+			return module
+		}
+	}
+	if len(group.modules) >= moduleGroupVariantLookupIndexThreshold {
+		group.variantLookupCacheLock.Lock()
+		if group.variantNameCache == nil {
+			group.variantNameCache = make(map[string]*moduleInfo)
+		}
+		if len(group.variantNameCache) < moduleGroupVariantLookupCacheLimit {
+			group.variantNameCache[name] = nil
+		}
+		group.variantLookupCacheLock.Unlock()
+	}
 	return nil
+}
+
+func (group *moduleGroup) exactVariant(variations variationMap) *moduleInfo {
+	// Most module groups have only one or two variants. A short scan avoids
+	// allocating an index for those groups; larger groups use a cached lookup
+	// because dependents commonly request the same exact variation repeatedly.
+	if len(group.modules) < moduleGroupVariantLookupIndexThreshold {
+		for _, module := range group.modules {
+			if module.variant.variations.equal(variations) {
+				return module
+			}
+		}
+		return nil
+	}
+
+	key := variations.cacheHash()
+	group.variantLookupCacheLock.RLock()
+	for _, entry := range group.exactVariantCache[key] {
+		if entry.variations.equal(variations) {
+			group.variantLookupCacheLock.RUnlock()
+			return entry.module
+		}
+	}
+	group.variantLookupCacheLock.RUnlock()
+
+	group.variantLookupCacheLock.Lock()
+	defer group.variantLookupCacheLock.Unlock()
+	for _, entry := range group.exactVariantCache[key] {
+		if entry.variations.equal(variations) {
+			return entry.module
+		}
+	}
+	var found *moduleInfo
+	for _, module := range group.modules {
+		if module.variant.variations.equal(variations) {
+			found = module
+			break
+		}
+	}
+	if group.variantLookupCacheSize >= moduleGroupVariantLookupCacheLimit {
+		return found
+	}
+	if group.exactVariantCache == nil {
+		group.exactVariantCache = make(map[uint64][]exactVariantCacheEntry)
+	}
+	group.exactVariantCache[key] = append(group.exactVariantCache[key], exactVariantCacheEntry{
+		variations: variations.clone(),
+		module:     found,
+	})
+	group.variantLookupCacheSize++
+	return found
+}
+
+func (group *moduleGroup) firstVariantMatching(variations variationMap, mutators []string) *moduleInfo {
+	if len(group.modules) == 0 {
+		return nil
+	}
+	if len(mutators) == 0 {
+		return group.modules[0]
+	}
+	if len(group.modules) < moduleGroupVariantLookupIndexThreshold {
+		for _, module := range group.modules {
+			if module.variant.variations.equalMatching(variations, mutators) {
+				return module
+			}
+		}
+		return nil
+	}
+	key := variations.projectionCacheHash(mutators)
+
+	group.variantLookupCacheLock.RLock()
+	for _, entry := range group.projectedVariantCache[key] {
+		if slices.Equal(entry.mutators, mutators) && entry.variations.equalMatching(variations, mutators) {
+			group.variantLookupCacheLock.RUnlock()
+			return entry.module
+		}
+	}
+	group.variantLookupCacheLock.RUnlock()
+
+	group.variantLookupCacheLock.Lock()
+	defer group.variantLookupCacheLock.Unlock()
+	for _, entry := range group.projectedVariantCache[key] {
+		if slices.Equal(entry.mutators, mutators) && entry.variations.equalMatching(variations, mutators) {
+			return entry.module
+		}
+	}
+	var found *moduleInfo
+	for _, module := range group.modules {
+		if module.variant.variations.equalMatching(variations, mutators) {
+			found = module
+			break
+		}
+	}
+	if group.variantLookupCacheSize >= moduleGroupVariantLookupCacheLimit {
+		return found
+	}
+	if group.projectedVariantCache == nil {
+		group.projectedVariantCache = make(map[uint64][]projectedVariantCacheEntry)
+	}
+	group.projectedVariantCache[key] = append(group.projectedVariantCache[key], projectedVariantCacheEntry{
+		variations: variations.cloneMatching(mutators),
+		mutators:   slices.Clone(mutators),
+		module:     found,
+	})
+	group.variantLookupCacheSize++
+	return found
+}
+
+func (group *moduleGroup) farVariant(variations variationMap) *moduleInfo {
+	if len(group.modules) < moduleGroupVariantLookupIndexThreshold {
+		var found *moduleInfo
+		bestDivergence := math.MaxInt
+		for _, module := range group.modules {
+			moduleVariations := module.variant.variations
+			if variations.subsetOf(moduleVariations) {
+				divergence := moduleVariations.differenceKeysCount(variations)
+				if divergence < bestDivergence {
+					found = module
+					bestDivergence = divergence
+				}
+			}
+		}
+		return found
+	}
+	key := variations.cacheHash()
+	group.variantLookupCacheLock.RLock()
+	for _, entry := range group.farVariantCache[key] {
+		if entry.variations.equal(variations) {
+			group.variantLookupCacheLock.RUnlock()
+			return entry.module
+		}
+	}
+	group.variantLookupCacheLock.RUnlock()
+
+	group.variantLookupCacheLock.Lock()
+	defer group.variantLookupCacheLock.Unlock()
+	for _, entry := range group.farVariantCache[key] {
+		if entry.variations.equal(variations) {
+			return entry.module
+		}
+	}
+	var found *moduleInfo
+	bestDivergence := math.MaxInt
+	for _, module := range group.modules {
+		moduleVariations := module.variant.variations
+		if variations.subsetOf(moduleVariations) {
+			divergence := moduleVariations.differenceKeysCount(variations)
+			if divergence < bestDivergence {
+				found = module
+				bestDivergence = divergence
+			}
+		}
+	}
+	if group.variantLookupCacheSize >= moduleGroupVariantLookupCacheLimit {
+		return found
+	}
+	if group.farVariantCache == nil {
+		group.farVariantCache = make(map[uint64][]farVariantCacheEntry)
+	}
+	group.farVariantCache[key] = append(group.farVariantCache[key], farVariantCacheEntry{
+		variations: variations.clone(),
+		module:     found,
+	})
+	group.variantLookupCacheSize++
+	return found
+}
+
+func (group *moduleGroup) invalidateVariantLookupCaches() {
+	group.variantLookupCacheLock.Lock()
+	group.variantNameCache = nil
+	group.exactVariantCache = nil
+	group.projectedVariantCache = nil
+	group.farVariantCache = nil
+	group.variantLookupCacheSize = 0
+	group.variantLookupCacheLock.Unlock()
 }
 
 // registerSupportedVariants registers the supported variants, but does not create them
@@ -536,6 +828,7 @@ func (c *Context) createVariantOnDemand(group *moduleGroup, onDemandVariants var
 		createdOnDemand:          true,
 		requestedOnDemandVariant: onDemandVariants,
 		relBlueprintsFile:        group.coreModuleInfo.relBlueprintsFile,
+		sourceDeclarationKey:     group.coreModuleInfo.sourceDeclarationKey,
 		pos:                      group.coreModuleInfo.pos,
 	}
 	newmodule.createdOnDemandReplaceWith = &newmodule
@@ -619,12 +912,13 @@ func (c *Context) rerunMutatorsOnVariantOnDemand(newmodule *moduleInfo, fromMuta
 
 type moduleInfo struct {
 	// set during Parse
-	typeName          string
-	factory           ModuleFactory
-	relBlueprintsFile string
-	pos               scanner.Position
-	propertyPos       map[string]scanner.Position
-	createdBy         *moduleInfo
+	typeName             string
+	factory              ModuleFactory
+	relBlueprintsFile    string
+	pos                  scanner.Position
+	propertyPos          map[string]scanner.Position
+	createdBy            *moduleInfo
+	sourceDeclarationKey string
 
 	variant variant
 
@@ -646,8 +940,9 @@ type moduleInfo struct {
 	waitingCount atomic.Int32
 
 	// set during each runMutator
-	splitModules           moduleList
-	obsoletedByNewVariants bool
+	splitModules                     moduleList
+	obsoletedByNewVariants           bool
+	pendingDependencyResolutionCache string
 
 	// Used by TransitionMutator implementations
 
@@ -723,15 +1018,23 @@ func (g *globResultCache) equal(other globResultCache) bool {
 
 type moduleIncrementalInfo struct {
 	commonIncrementalInfo
-	buildActionInputHash proptools.Hash
-	orderOnlyStrings     []string
-	incrementalDebugInfo []byte
+	buildActionInputHash                proptools.Hash
+	orderOnlyStrings                    []string
+	incrementalDebugInfo                []byte
+	incrementalRestoreReason            string
+	cachedProviderInitialValueHashes    []proptools.Hash
+	hasCachedProviderInitialValueHashes bool
 
 	// providersHash is the hash of the providers set by this module
 	providersHash proptools.Hash
 	// transitiveProvidersHash is the hash of the providers set by
 	// this module and all transitive dependencies of this module.
 	transitiveProvidersHash proptools.Hash
+}
+
+type moduleProviderDependency struct {
+	moduleKey  string
+	providerId int
 }
 
 type commonIncrementalInfo struct {
@@ -790,8 +1093,26 @@ func (module *moduleInfo) moduleCacheKey() string {
 	if variant == "" {
 		variant = "none"
 	}
+	if cacheIdentity, ok := module.logicModule.(ModuleActionCacheIdentity); ok {
+		return calculateFileNameHash(fmt.Sprintf("%s-%s-%s-%s",
+			module.relBlueprintsFile, cacheIdentity.ModuleActionCacheIdentity(), variant, module.typeName))
+	}
 	return calculateFileNameHash(fmt.Sprintf("%s-%s-%s-%s",
 		filepath.Dir(module.relBlueprintsFile), module.cachedUniqueName, variant, module.typeName))
+}
+
+// ModuleActionCacheIdentity provides a stable cache identity for modules whose
+// user-visible unique name contains process-specific data. It only affects the
+// incremental build-action cache key; the module's Blueprint name is unchanged.
+type ModuleActionCacheIdentity interface {
+	ModuleActionCacheIdentity() string
+}
+
+// ModuleActionCacheOptOut marks modules whose build actions depend on mutable
+// module state that is not restored from the incremental build-action cache.
+// Such modules must regenerate their build actions on every build.
+type ModuleActionCacheOptOut interface {
+	DisableModuleActionCache()
 }
 
 // @auto-generate: gob
@@ -849,6 +1170,17 @@ func (vm variationMap) cloneMatching(mutators []string) variationMap {
 	}
 }
 
+func (vm variationMap) equalMatching(other variationMap, mutators []string) bool {
+	for _, mutator := range mutators {
+		value, exists := vm.variations[mutator]
+		otherValue, otherExists := other.variations[mutator]
+		if exists != otherExists || value != otherValue {
+			return false
+		}
+	}
+	return true
+}
+
 // Compare this variationMap to another one.  Returns true if the every entry in this map
 // exists and has the same value in the other map.
 func (vm variationMap) subsetOf(other variationMap) bool {
@@ -862,6 +1194,59 @@ func (vm variationMap) subsetOf(other variationMap) bool {
 
 func (vm variationMap) equal(other variationMap) bool {
 	return maps.Equal(vm.variations, other.variations)
+}
+
+func (vm variationMap) cacheHash() uint64 {
+	const (
+		fnvOffset = uint64(14695981039346656037)
+		fnvPrime  = uint64(1099511628211)
+	)
+	var sum, xor uint64
+	for mutator, variation := range vm.variations {
+		hash := variationPairCacheHash(fnvOffset, fnvPrime, mutator, variation, true)
+		sum += hash
+		xor ^= rotateVariationHash(hash)
+	}
+	return sum ^ xor*0x9e3779b97f4a7c15 ^ uint64(len(vm.variations))
+}
+
+func (vm variationMap) projectionCacheHash(mutators []string) uint64 {
+	const (
+		fnvOffset = uint64(14695981039346656037)
+		fnvPrime  = uint64(1099511628211)
+	)
+	var sum, xor uint64
+	for _, mutator := range mutators {
+		variation, exists := vm.variations[mutator]
+		hash := variationPairCacheHash(fnvOffset, fnvPrime, mutator, variation, exists)
+		sum += hash
+		xor ^= rotateVariationHash(hash)
+	}
+	return sum ^ xor*0x9e3779b97f4a7c15 ^ uint64(len(mutators))
+}
+
+func variationPairCacheHash(offset, prime uint64, mutator, variation string, present bool) uint64 {
+	hashString := func(hash uint64, value string) uint64 {
+		for i := 0; i < len(value); i++ {
+			hash = (hash ^ uint64(value[i])) * prime
+		}
+		return hash
+	}
+	hash := hashString(offset, mutator)
+	delimiter := uint64(0xfe)
+	if present {
+		delimiter = 0xff
+	}
+	hash = (hash ^ delimiter) * prime
+	return hashString(hash, variation)
+}
+
+func rotateVariationHash(hash uint64) uint64 {
+	shift := int(hash & 63)
+	if shift == 0 {
+		return hash
+	}
+	return hash<<shift | hash>>(64-shift)
 }
 
 func (vm *variationMap) set(mutator, variation string) {
@@ -916,12 +1301,6 @@ type singletonInfo struct {
 	commonIncrementalInfo
 	// Whether this singleton supports incremental build.
 	incrementalSupported bool
-	// The provider hashes of all the singletons that this singleton might depend on.
-	// These values are calculated before calling the GenerateBuildAction of the current
-	// singleton, and combined with the hashes of all the module providers that this
-	// singleton might depend on, we can decide if the input of the GenerateBuildAction
-	// has any change, and skip the execution of it if there is no change.
-	providerValueHashes []proptools.Hash
 }
 
 type mutatorInfo struct {
@@ -932,13 +1311,15 @@ type mutatorInfo struct {
 	index                      int
 	transitionMutator          *transitionMutatorImpl
 
-	usesRename              bool
-	usesReverseDependencies bool
-	usesReplaceDependencies bool
-	usesCreateModule        bool
-	mutatesDependencies     bool
-	mutatesGlobalState      bool
-	prePartial              bool
+	usesRename                   bool
+	usesReverseDependencies      bool
+	usesReplaceDependencies      bool
+	usesCreateModule             bool
+	mutatesDependencies          bool
+	mutatesGlobalState           bool
+	incrementalStateCache        MutatorStateCache
+	dependencyLookupCacheVersion string
+	prePartial                   bool
 }
 
 func newContext() *Context {
@@ -948,6 +1329,7 @@ func newContext() *Context {
 		EventHandler:          &eventHandler,
 		moduleFactories:       make(map[string]ModuleFactory),
 		nameInterface:         NewSimpleNameInterface(),
+		createdModuleGroups:   make(map[*moduleInfo][]*moduleGroup),
 		fs:                    pathtools.OsFs,
 		includeTags:           &IncludeTags{},
 		sourceRootDirs:        &SourceRootDirs{},
@@ -1099,8 +1481,41 @@ func (c *Context) GetIncrementalEnabled() bool {
 	return c.incrementalEnabled
 }
 
+// PrepareIncrementalAnalysis opens the action cache and compares source module
+// declarations after parsing but before dependency and variant mutators run.
+// This makes the previous declaration graph available to incremental analysis.
+func (c *Context) PrepareIncrementalAnalysis() error {
+	if !c.GetIncrementalEnabled() {
+		return nil
+	}
+	if c.keyValueStoreCache == nil {
+		c.keyValueStoreCache = &KeyValueStoreCache{}
+		dbPath := filepath.Join(c.SrcDir(), c.IncrementalDBDir())
+		if !c.GetIncrementalAnalysis() {
+			if err := errors.Join(c.keyValueStoreCache.reset(c, dbPath), c.fs.Remove(filepath.Join(dbPath, OrderOnlyStringsCacheFile))); err != nil {
+				return fmt.Errorf("error resetting incremental db: %w", err)
+			}
+		}
+		if err := c.keyValueStoreCache.open(dbPath); err != nil {
+			return fmt.Errorf("error opening incremental db: %w", err)
+		}
+		c.EncContext = gobtools.NewEncContext(c.keyValueStoreCache.referencesDb)
+	}
+	if c.GetIncrementalAnalysis() && !c.incrementalAnalysisPrepared {
+		if err := c.compareSourceModuleDeclarationSnapshot(); err != nil {
+			return fmt.Errorf("error comparing source module declarations: %w", err)
+		}
+	}
+	c.incrementalAnalysisPrepared = true
+	return nil
+}
+
 func (c *Context) SetIncrementalDebugFile(file string) {
 	c.incrementalDebugFile = file
+}
+
+func (c *Context) SetIncrementalDebugMissesOnly(missesOnly bool) {
+	c.incrementalDebugMissesOnly = missesOnly
 }
 
 func (c *Context) SetPartialAnalysisTargets(targets string) {
@@ -1126,12 +1541,17 @@ func (c *Context) SetSplitAllVariants(s bool) {
 }
 
 func (c *Context) CacheAllBuildActions(soongOutDir string) (err error) {
-	if err := cacheEncData(c, soongOutDir, OrderOnlyStringsCacheFile, &c.orderOnlyStringsCache); err != nil {
-		return err
-	}
 	defer func() {
 		err = errors.Join(err, c.keyValueStoreCache.close())
 	}()
+	if err := cacheEncData(c, soongOutDir, OrderOnlyStringsCacheFile, &c.orderOnlyStringsCache); err != nil {
+		return err
+	}
+	if c.GetIncrementalEnabled() {
+		if err := c.writeSourceModuleDeclarationSnapshots(); err != nil {
+			return err
+		}
+	}
 	err = c.EncContext.EncodeReferences()
 	return err
 }
@@ -1316,9 +1736,58 @@ type MutatorHandle interface {
 	// adjacent mutators into a single mutator pass.
 	MutatesGlobalState() MutatorHandle
 
+	// IncrementalStateCache enables per-module incremental execution for this mutator.
+	// The mutator must only read the current module and fixed configuration, and may
+	// only mutate state represented by the supplied snapshot. It must not inspect
+	// dependencies, mutate other modules, providers, dependencies, variants, or global
+	// state. Modules whose snapshots cannot be restored are visited normally.
+	IncrementalStateCache(cache MutatorStateCache) MutatorHandle
+
+	// CacheDependencyLookups enables reuse of successful dependency-to-variant
+	// resolutions for unchanged module declarations. The mutator callback still runs,
+	// so its module-local effects and dependency declarations are recomputed. The
+	// mutator must only use this when all inputs that can change variant selection
+	// are covered by the source declaration graph and incremental configuration check.
+	CacheDependencyLookups(version string) MutatorHandle
+
 	PrePartial() MutatorHandle
 
 	setTransitionMutator(impl *transitionMutatorImpl) MutatorHandle
+}
+
+// MutatorStateCache snapshots and restores the module-local state produced by an
+// incremental-safe mutator. Implementations must include every piece of module
+// state that the mutator changes and may omit state that the mutator leaves
+// untouched. The mutator may only read its current module and fixed
+// configuration; it must not inspect dependencies, mutate other modules,
+// providers, dependencies, variants, or global state.
+type MutatorStateCache interface {
+	Snapshot(module Module) ([]byte, error)
+	Restore(module Module, state []byte) error
+}
+
+// MutatorStateCacheNoModuleState marks a cache for a mutator that does not
+// produce module-local state. Unchanged modules can then be skipped without
+// loading per-module cache entries.
+type MutatorStateCacheNoModuleState interface {
+	MutatorStateCache
+	NoModuleState()
+}
+
+// MutatorStateCacheVersion lets a cache invalidate prior incremental decisions
+// when the mutator's behavior changes. The version is persisted per mutator;
+// changing it forces a full visit before subset execution is re-enabled.
+type MutatorStateCacheVersion interface {
+	MutatorStateCache
+	CacheVersion() string
+}
+
+// MutatorStateCacheModuleFilter lets a cache opt modules out when the mutator
+// is guaranteed to have no effects on them. The filter must depend only on the
+// module and fixed configuration inputs covered by incremental validity.
+type MutatorStateCacheModuleFilter interface {
+	MutatorStateCache
+	ShouldRun(module Module) bool
 }
 
 func (mutator *mutatorInfo) UsesRename() MutatorHandle {
@@ -1348,6 +1817,22 @@ func (mutator *mutatorInfo) MutatesDependencies() MutatorHandle {
 
 func (mutator *mutatorInfo) MutatesGlobalState() MutatorHandle {
 	mutator.mutatesGlobalState = true
+	return mutator
+}
+
+func (mutator *mutatorInfo) IncrementalStateCache(cache MutatorStateCache) MutatorHandle {
+	if cache == nil {
+		panic("IncrementalStateCache requires a non-nil cache")
+	}
+	mutator.incrementalStateCache = cache
+	return mutator
+}
+
+func (mutator *mutatorInfo) CacheDependencyLookups(version string) MutatorHandle {
+	if version == "" {
+		panic("CacheDependencyLookups requires a non-empty version")
+	}
+	mutator.dependencyLookupCacheVersion = version
 	return mutator
 }
 
@@ -2271,7 +2756,22 @@ func processModuleDef(moduleDef *parser.Module,
 }
 
 func (c *Context) addModule(module *moduleInfo) []error {
+	if creator := module.createdBy; creator != nil && creator.obsoletedByNewVariants {
+		module.createdBy = creator.splitModules.firstModule()
+	}
+
 	name := module.logicModule.Name()
+	sourceDeclarationName := name
+	if sourceName, ok := module.logicModule.(ModuleSourceDeclarationName); ok {
+		stableName := sourceName.SourceDeclarationName()
+		if stableName == "" {
+			return []error{&BlueprintError{
+				Err: fmt.Errorf("module type %q returned an empty source declaration name", module.typeName),
+				Pos: module.pos,
+			}}
+		}
+		sourceDeclarationName = fmt.Sprintf("%s\x00%d:%d", stableName, module.pos.Line, module.pos.Column)
+	}
 	if name == "" {
 		return []error{
 			&BlueprintError{
@@ -2280,10 +2780,25 @@ func (c *Context) addModule(module *moduleInfo) []error {
 			},
 		}
 	}
+	if module.createdBy == nil && module.relBlueprintsFile != "" {
+		module.sourceDeclarationKey = sourceModuleDeclarationKey(module.relBlueprintsFile, module.typeName, sourceDeclarationName)
+		hash, err := proptools.CalculateHashReflection(module.properties)
+		if err != nil {
+			return []error{&BlueprintError{Err: fmt.Errorf("failed to hash source module properties: %w", err), Pos: module.pos}}
+		}
+		if c.sourceModuleDeclarations == nil {
+			c.sourceModuleDeclarations = make(map[string]proptools.Hash)
+		}
+		c.sourceModuleDeclarations[module.sourceDeclarationKey] = hash
+	} else if module.createdBy != nil {
+		module.sourceDeclarationKey = module.createdBy.sourceDeclarationKey
+	}
 
 	group := &moduleGroup{
-		name:    name,
-		modules: moduleList{module},
+		name:                 name,
+		sourceDeclarationKey: module.sourceDeclarationKey,
+		index:                len(c.moduleGroups),
+		modules:              moduleList{module},
 	}
 	module.group = group
 	namespace, errs := c.nameInterface.NewModule(
@@ -2299,6 +2814,13 @@ func (c *Context) addModule(module *moduleInfo) []error {
 	group.namespace = namespace
 
 	c.moduleGroups = append(c.moduleGroups, group)
+	if c.moduleGroupsBySource == nil {
+		c.moduleGroupsBySource = make(map[string][]*moduleGroup)
+	}
+	c.moduleGroupsBySource[group.sourceDeclarationKey] = append(c.moduleGroupsBySource[group.sourceDeclarationKey], group)
+	if module.createdBy != nil {
+		c.createdModuleGroups[module.createdBy] = append(c.createdModuleGroups[module.createdBy], group)
+	}
 
 	return nil
 }
@@ -2316,7 +2838,7 @@ func (c *Context) ResolveDependencies(config interface{}) (deps []string, errs [
 // coalesceMutators takes the list of mutators and returns a list of lists of mutators,
 // where sublist is a compatible group of mutators that can be run with relaxed
 // intra-mutator ordering.
-func coalesceMutators(mutators []*mutatorInfo) [][]*mutatorInfo {
+func coalesceMutators(mutators []*mutatorInfo, useIncrementalStateCaches bool) [][]*mutatorInfo {
 	var coalescedMutators [][]*mutatorInfo
 	var last *mutatorInfo
 
@@ -2325,6 +2847,8 @@ func coalesceMutators(mutators []*mutatorInfo) [][]*mutatorInfo {
 	coalescable := func(m *mutatorInfo) bool {
 		return m.bottomUpMutator != nil &&
 			m.transitionMutator == nil &&
+			(!useIncrementalStateCaches || m.incrementalStateCache == nil) &&
+			m.dependencyLookupCacheVersion == "" &&
 			!m.usesCreateModule &&
 			!m.usesReplaceDependencies &&
 			!m.usesReverseDependencies &&
@@ -2352,12 +2876,23 @@ func (c *Context) resolveDependencies(ctx context.Context, config interface{}) (
 	pprof.Do(ctx, pprof.Labels("blueprint", "ResolveDependencies"), func(ctx context.Context) {
 		c.initProviders()
 
-		errs = c.updateDependencies()
-		if len(errs) > 0 {
-			return
+		if c.dependenciesReady {
+			errs = c.updateDependencies()
+			if len(errs) > 0 {
+				return
+			}
+		} else {
+			// A freshly parsed Context has no dependency edges yet, and each
+			// source module starts in a one-variant group. Mutators add edges as
+			// they resolve dependencies, so rebuilding empty forward/reverse
+			// lists here only scans every module group twice.
+			c.cachedDepsModified = true
 		}
 
-		mutatorGroups := coalesceMutators(c.mutatorInfo)
+		// Keep the default/Make-compatible mutator schedule unchanged. Stateful
+		// mutator caching is an opt-in optimization for incremental analysis only.
+		useIncrementalStateCaches := c.GetIncrementalEnabled() && c.GetIncrementalAnalysis() && c.keyValueStoreCache != nil
+		mutatorGroups := coalesceMutators(c.mutatorInfo, useIncrementalStateCaches)
 
 		deps, errs = c.runMutators(ctx, config, mutatorGroups)
 		if len(errs) > 0 {
@@ -2442,17 +2977,9 @@ func (c *Context) applyTransitions(config any, module *moduleInfo, depTag Depend
 		}
 
 		earlierVariantCreatingMutators := c.transitionMutatorNames[:transitionMutator.index]
-		filteredVariant := variant.cloneMatching(earlierVariantCreatingMutators)
 
 		// Find an appropriate module to use as the context for the IncomingTransition.
-		var matchingInputVariant *moduleInfo
-		for _, module := range group.modules {
-			filteredInputVariant := module.variant.variations.cloneMatching(earlierVariantCreatingMutators)
-			if filteredInputVariant.equal(filteredVariant) {
-				matchingInputVariant = module
-				break
-			}
-		}
+		matchingInputVariant := group.firstVariantMatching(variant, earlierVariantCreatingMutators)
 
 		if onDemandMatchingVariant != nil {
 			// Mutate the onDemand variant through a moving window,
@@ -2553,34 +3080,11 @@ func (c *Context) findVariant(config any, module *moduleInfo, depTag DependencyT
 		}
 	}
 
-	// check returns a bool for whether the requested newVariant matches the given variant from possibleDeps, and a
-	// divergence score.  A score of 0 is best match, and a positive integer is a worse match.
-	// For a non-far search, the score is always 0 as the match must always be exact.  For a far search,
-	// the score is the number of variants that are present in the given variant but not newVariant.
-	check := func(variant variationMap) (bool, int) {
-		if far {
-			if newVariant.subsetOf(variant) {
-				return true, variant.differenceKeysCount(newVariant)
-			}
-		} else {
-			if variant.equal(newVariant) {
-				return true, 0
-			}
-		}
-		return false, math.MaxInt
-	}
-
 	var foundDep *moduleInfo
-	bestDivergence := math.MaxInt
-	for _, m := range possibleDeps.modules {
-		if match, divergence := check(m.variant.variations); match && divergence < bestDivergence {
-			foundDep = m
-			bestDivergence = divergence
-			if !far {
-				// non-far dependencies use equality, so only the first match needs to be checked.
-				break
-			}
-		}
+	if !far {
+		foundDep = possibleDeps.exactVariant(newVariant)
+	} else {
+		foundDep = possibleDeps.farVariant(newVariant)
 	}
 
 	if foundDep == nil &&
@@ -2598,7 +3102,7 @@ func (c *Context) findVariant(config any, module *moduleInfo, depTag DependencyT
 	return foundDep, newVariant, nil
 }
 
-func (c *Context) addVariationDependency(module *moduleInfo, mutator *mutatorInfo, config any, variations []Variation,
+func (c *Context) addVariationDependency(mctx *mutatorContext, module *moduleInfo, variations []Variation,
 	tag DependencyTag, depName string, far bool) (*moduleInfo, []error) {
 	if _, ok := tag.(BaseDependencyTag); ok {
 		panic("BaseDependencyTag is not allowed to be used directly!")
@@ -2609,7 +3113,7 @@ func (c *Context) addVariationDependency(module *moduleInfo, mutator *mutatorInf
 		return nil, c.discoveredMissingDependencies(module, depName, variationMap{})
 	}
 
-	foundDep, newVariant, errs := c.findVariant(config, module, tag, possibleDeps, variations, far, false, mutator.index)
+	foundDep, newVariant, errs := mctx.findDependencyVariant(possibleDeps, depName, tag, variations, far, false)
 	if errs != nil {
 		return nil, errs
 	}
@@ -3231,11 +3735,125 @@ func parallelVisit(moduleIter iter.Seq[*moduleInfo], order visitOrderer, limit i
 		// Invariant check: if there was no dependency cycle and no cancellation every module
 		// should have been visited.
 		if visited != toVisit {
-			panic(fmt.Errorf("parallelVisit ran %d visitors, expected %d. Unvisited modules map: %v. Try rebuilding with SOONG_SPLIT_ALL_VARIANTS=true. Please file a go/soong-bug if build is successful with the environment variable.", visited, toVisit, hung))
+			panic(fmt.Errorf("parallelVisit ran %d visitors, expected %d. Hung module summary: %s. Try rebuilding with SOONG_SPLIT_ALL_VARIANTS=true. Please file a go/soong-bug if build is successful with the environment variable.",
+				visited, toVisit, parallelVisitHungSummary(hung, order)))
 		}
 	}
 
 	return nil
+}
+
+func parallelVisitHungSummary(hung map[*moduleInfo]bool, order visitOrderer) string {
+	remainingCounts := make(map[int]int)
+	pendingCounts := make(map[int]int)
+	var mismatches []string
+	for module := range hung {
+		remaining := int(module.waitingCount.Load())
+		pending := 0
+		for _, dependency := range visitOrdererDependencies(order, module) {
+			if hung[dependency] {
+				pending++
+			}
+		}
+		remainingCounts[remaining]++
+		pendingCounts[pending]++
+		if remaining != pending && len(mismatches) < 12 {
+			var dependencySummary []string
+			for _, dependency := range visitOrdererDependencies(order, module) {
+				propagationCount := 0
+				for _, dependent := range visitOrdererDependents(order, dependency) {
+					if dependent == module {
+						propagationCount++
+					}
+				}
+				dependencySummary = append(dependencySummary, fmt.Sprintf("%s{%s}:propagations=%d",
+					dependency.Name(), dependency.variant.name, propagationCount))
+			}
+			mismatches = append(mismatches, fmt.Sprintf("%s{%s}: waiting=%d pending=%d dependencies=%v",
+				module.Name(), module.variant.name, remaining, pending, dependencySummary))
+		}
+	}
+
+	formatCounts := func(counts map[int]int) string {
+		keys := slices.Sorted(maps.Keys(counts))
+		var result strings.Builder
+		result.WriteByte('{')
+		for i, key := range keys {
+			if i > 0 {
+				result.WriteString(", ")
+			}
+			fmt.Fprintf(&result, "%d:%d", key, counts[key])
+		}
+		result.WriteByte('}')
+		return result.String()
+	}
+
+	return fmt.Sprintf("%d modules; waiting counts=%s; unresolved dependencies=%s; mismatches=%v",
+		len(hung), formatCounts(remainingCounts), formatCounts(pendingCounts), mismatches)
+}
+
+// parallelVisitSubset visits only the modules in modules. Dependencies outside
+// the subset are treated as already complete; edges between selected modules
+// retain the ordering imposed by order.
+func parallelVisitSubset(modules []*moduleInfo, order visitOrderer, limit int,
+	visit func(module *moduleInfo, pause pauseFunc) bool) []error {
+	included := make(map[*moduleInfo]struct{}, len(modules))
+	for _, module := range modules {
+		included[module] = struct{}{}
+	}
+	return parallelVisit(slices.Values(modules), subsetVisitOrderer{order: order, included: included}, limit, visit)
+}
+
+type subsetVisitOrderer struct {
+	order    visitOrderer
+	included map[*moduleInfo]struct{}
+}
+
+func (o subsetVisitOrderer) waitCount(module *moduleInfo) int {
+	count := 0
+	for _, dependency := range visitOrdererDependencies(o.order, module) {
+		if _, ok := o.included[dependency]; ok {
+			count++
+		}
+	}
+	return count
+}
+
+func (o subsetVisitOrderer) propagate(module *moduleInfo) []*moduleInfo {
+	modules := visitOrdererDependents(o.order, module)
+	filtered := make([]*moduleInfo, 0, len(modules))
+	for _, dependent := range modules {
+		if _, ok := o.included[dependent]; ok {
+			filtered = append(filtered, dependent)
+		}
+	}
+	return filtered
+}
+
+func visitOrdererDependencies(order visitOrderer, module *moduleInfo) []*moduleInfo {
+	switch order.(type) {
+	case unorderedVisitorImpl:
+		return nil
+	case bottomUpVisitorImpl:
+		return module.forwardDeps
+	case topDownVisitorImpl:
+		return module.reverseDeps
+	default:
+		panic(fmt.Errorf("unsupported visit orderer %T for subset visit", order))
+	}
+}
+
+func visitOrdererDependents(order visitOrderer, module *moduleInfo) []*moduleInfo {
+	switch order.(type) {
+	case unorderedVisitorImpl:
+		return nil
+	case bottomUpVisitorImpl:
+		return module.reverseDeps
+	case topDownVisitorImpl:
+		return module.forwardDeps
+	default:
+		panic(fmt.Errorf("unsupported visit orderer %T for subset visit", order))
+	}
 }
 
 func cycleError(cycle []*moduleInfo) (errs []error) {
@@ -3292,6 +3910,206 @@ func (c *Context) updateDependencies() (errs []error) {
 	}
 
 	return
+}
+
+// updateDependenciesForModules refreshes dependency ordering for modules whose
+// outgoing edges or module-group ordering changed.  Unlike updateDependencies,
+// it leaves unrelated modules and their reverse-dependency lists untouched.
+// The caller must pass every module whose group position changed, plus every
+// module whose direct dependencies changed.
+func (c *Context) updateDependenciesForModules(modules []*moduleInfo) {
+	c.cachedDepsModified = true
+
+	uniqueModules := make(map[*moduleInfo]struct{}, len(modules))
+	orderedModules := make([]*moduleInfo, 0, len(modules))
+	affectedReverseDeps := make(map[*moduleInfo]struct{})
+	for _, module := range modules {
+		if module == nil {
+			continue
+		}
+		if _, exists := uniqueModules[module]; !exists {
+			uniqueModules[module] = struct{}{}
+			orderedModules = append(orderedModules, module)
+		}
+	}
+	moduleIndexes := make(map[*moduleInfo]int, len(orderedModules))
+	for _, module := range orderedModules {
+		if module.group == nil {
+			c.updateDependencies()
+			return
+		}
+		index := slices.Index(module.group.modules, module)
+		if index < 0 {
+			c.updateDependencies()
+			return
+		}
+		moduleIndexes[module] = index
+	}
+
+	// Count each affected module's old outgoing edges, then filter each affected
+	// reverse list once. The graph can legitimately contain both an implicit
+	// ordering edge and a direct dependency between modules in the same group.
+	removedEdges := make(map[*moduleInfo]map[*moduleInfo]int)
+	for _, module := range orderedModules {
+		for _, dependency := range module.forwardDeps {
+			affectedReverseDeps[dependency] = struct{}{}
+			if removedEdges[dependency] == nil {
+				removedEdges[dependency] = make(map[*moduleInfo]int)
+			}
+			removedEdges[dependency][module]++
+		}
+	}
+	for dependency, modulesToRemove := range removedEdges {
+		reverseDeps := dependency.reverseDeps[:0]
+		for _, reverseDep := range dependency.reverseDeps {
+			if count := modulesToRemove[reverseDep]; count > 0 {
+				modulesToRemove[reverseDep] = count - 1
+			} else {
+				reverseDeps = append(reverseDeps, reverseDep)
+			}
+		}
+		dependency.reverseDeps = reverseDeps
+	}
+
+	for _, module := range orderedModules {
+		group := module.group
+		selfIndex := moduleIndexes[module]
+
+		module.forwardDeps = module.forwardDeps[:0]
+		module.forwardDeps = slices.Grow(module.forwardDeps, selfIndex+len(module.directDeps))
+		module.forwardDeps = append(module.forwardDeps, group.modules[:selfIndex]...)
+		for _, dependency := range module.directDeps {
+			module.forwardDeps = append(module.forwardDeps, dependency.module)
+		}
+		for _, dependency := range module.forwardDeps {
+			dependency.reverseDeps = append(dependency.reverseDeps, module)
+			affectedReverseDeps[dependency] = struct{}{}
+		}
+	}
+
+	// updateDependencies builds reverseDeps by visiting modules in module-group
+	// order. Reestablish that order for the reverse lists touched above so that
+	// incremental and full graph updates remain deterministic and equivalent.
+	for dependency := range affectedReverseDeps {
+		sort.SliceStable(dependency.reverseDeps, func(i, j int) bool {
+			a, b := dependency.reverseDeps[i], dependency.reverseDeps[j]
+			if a.group == nil || b.group == nil {
+				return a.group != nil && b.group == nil
+			}
+			if a.group.index != b.group.index {
+				return a.group.index < b.group.index
+			}
+			return slices.Index(a.group.modules, a) < slices.Index(b.group.modules, b)
+		})
+	}
+}
+
+// updateReverseDepsForNewDirectDeps applies the reverse edges for modules that
+// added direct dependencies in the current mutator. The caller supplies these
+// modules in arbitrary order; sorting by their stable graph position preserves
+// the order used by the previous full module-list scan.
+func updateReverseDepsForNewDirectDeps(modules []*moduleInfo) {
+	slices.SortStableFunc(modules, func(a, b *moduleInfo) int {
+		if groupOrder := cmp.Compare(a.group.index, b.group.index); groupOrder != 0 {
+			return groupOrder
+		}
+		return cmp.Compare(slices.Index(a.group.modules, a), slices.Index(b.group.modules, b))
+	})
+
+	for _, module := range modules {
+		for _, dependency := range module.newDirectDeps {
+			dependency.reverseDeps = append(dependency.reverseDeps, module)
+		}
+		module.newDirectDeps = nil
+	}
+}
+
+// updateSplitVariantReferences inserts variants created by a transition mutator
+// and repairs edges that still refer to the obsoleted source variants. The
+// reverse-dependency lists identify existing consumers; modules that added a
+// dependency in this same mutator are supplied separately because their new
+// reverse edges have not been installed yet.
+func (c *Context) updateSplitVariantReferences(splitSources, modulesWithNewDeps []*moduleInfo) []*moduleInfo {
+	var changedDependencyModules []*moduleInfo
+	slices.SortStableFunc(splitSources, func(a, b *moduleInfo) int {
+		if groupOrder := cmp.Compare(a.group.index, b.group.index); groupOrder != 0 {
+			return groupOrder
+		}
+		return cmp.Compare(slices.Index(a.group.modules, a), slices.Index(b.group.modules, b))
+	})
+
+	for _, source := range splitSources {
+		if source.splitModules == nil {
+			continue
+		}
+		group := source.group
+		index := slices.Index(group.modules, source)
+		if index < 0 {
+			panic(fmt.Sprintf("split source %s is missing from its module group", source))
+		}
+		group.modules, _ = spliceModules(group.modules, index, source.splitModules)
+		group.invalidateVariantLookupCaches()
+
+		firstVariant := source.splitModules.firstModule()
+		updatedDependents := make(map[*moduleInfo]struct{}, len(source.reverseDeps)+len(modulesWithNewDeps))
+		orderedDependents := make([]*moduleInfo, 0, len(source.reverseDeps)+len(modulesWithNewDeps))
+		addDependent := func(dependent *moduleInfo) {
+			if _, exists := updatedDependents[dependent]; exists {
+				return
+			}
+			updatedDependents[dependent] = struct{}{}
+			orderedDependents = append(orderedDependents, dependent)
+		}
+		for _, dependent := range source.reverseDeps {
+			addDependent(dependent)
+		}
+		for _, dependent := range modulesWithNewDeps {
+			addDependent(dependent)
+		}
+		for _, dependent := range orderedDependents {
+			dependentChanged := false
+			for i, dependency := range dependent.directDeps {
+				if dependency.module == source {
+					dependent.directDeps[i].module = firstVariant
+					dependentChanged = true
+				}
+			}
+			if dependentChanged {
+				changedDependencyModules = append(changedDependencyModules, dependent)
+			}
+		}
+
+		for _, childGroup := range c.createdModuleGroups[source] {
+			updatedCreator := false
+			for _, child := range childGroup.modules {
+				if child.createdBy == source {
+					child.createdBy = firstVariant
+					updatedCreator = true
+				}
+			}
+			if updatedCreator && !slices.Contains(c.createdModuleGroups[firstVariant], childGroup) {
+				c.createdModuleGroups[firstVariant] = append(c.createdModuleGroups[firstVariant], childGroup)
+			}
+		}
+	}
+
+	// Split sources are removed from their module groups. Remove their outgoing
+	// reverse edges as well, or later top-down visits will wait for obsolete
+	// modules that are no longer present in iterateAllVariants.
+	for _, source := range splitSources {
+		if source.splitModules == nil {
+			continue
+		}
+		for _, dependency := range source.forwardDeps {
+			dependency.reverseDeps = slices.DeleteFunc(dependency.reverseDeps, func(reverseDep *moduleInfo) bool {
+				return reverseDep == source
+			})
+		}
+		source.forwardDeps = nil
+		source.reverseDeps = nil
+	}
+
+	return changedDependencyModules
 }
 
 // Gets a list of strings from the given list of ninjaStrings by invoking ninjaString.Value on each.
@@ -3388,20 +4206,9 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
 		// TODO(b/356414070): Revisit this logic once we have a clearer picture about
 		// how the incremental build pieces fit together.
 		if c.GetIncrementalEnabled() {
-			if c.keyValueStoreCache == nil {
-				c.keyValueStoreCache = &KeyValueStoreCache{}
-				dbPath := filepath.Join(c.SrcDir(), c.IncrementalDBDir())
-				// Remove gob files and all the cached data from the key-value store for a full build.
-				if !c.GetIncrementalAnalysis() {
-					err := errors.Join(c.keyValueStoreCache.reset(c, dbPath), c.fs.Remove(filepath.Join(dbPath, OrderOnlyStringsCacheFile)))
-					if err != nil {
-						panic(fmt.Errorf("error resetting incremental db: %w", err))
-					}
-				}
-				if err := c.keyValueStoreCache.open(dbPath); err != nil {
-					panic(fmt.Errorf("error opening incremental db: %w", err))
-				}
-				c.EncContext = gobtools.NewEncContext(c.keyValueStoreCache.referencesDb)
+			if err := c.PrepareIncrementalAnalysis(); err != nil {
+				errs = []error{err}
+				return
 			}
 
 			for _, p := range packageContexts {
@@ -3491,6 +4298,9 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
 
 func (c *Context) runMutators(ctx context.Context, config interface{}, mutatorGroups [][]*mutatorInfo) (deps []string, errs []error) {
 	c.finishedMutators = make([]bool, len(c.mutatorInfo))
+	if c.mutatorVisitStatsEnabled {
+		c.mutatorVisitStats = make(map[string]MutatorVisitStats)
+	}
 
 	pprof.Do(ctx, pprof.Labels("blueprint", "runMutators"), func(ctx context.Context) {
 		mutatorIndexAfterLastCreateModule := -1
@@ -3561,6 +4371,43 @@ func (c *Context) runMutators(ctx context.Context, config interface{}, mutatorGr
 			}
 		}
 	})
+	if c.mutatorVisitStatsEnabled {
+		stats := c.MutatorVisitStats()
+		mutatorNames := make([]string, 0, len(stats))
+		var totalVisited uint64
+		var totalCacheScanned uint64
+		var totalElapsed time.Duration
+		for name, stat := range stats {
+			mutatorNames = append(mutatorNames, name)
+			totalVisited += stat.VisitedVariants
+			totalCacheScanned += stat.StateCacheScannedVariants
+			totalElapsed += stat.Elapsed
+		}
+		sort.Strings(mutatorNames)
+		fmt.Fprintf(os.Stderr, "soong: mutator visits: %d callbacks across %d groups; cache selection scanned %d variants in %s\n", totalVisited, len(stats), totalCacheScanned, totalElapsed)
+		for _, name := range mutatorNames {
+			stat := stats[name]
+			dependencyMode := "none"
+			if stat.FullDependencyRefresh {
+				dependencyMode = "full"
+			} else if stat.DependencyUpdateModules != 0 {
+				dependencyMode = "subset"
+			}
+			fmt.Fprintf(os.Stderr, "soong: mutator %s: cache selection scanned %d, filtered %d, hit/miss %d/%d, restore errors %d, callbacks %d; lookup %s, restore %s, dependency lookup hit/miss %d/%d in %s, callback %s, dependencies %s (%s, %d modules), total %s\n",
+				name, stat.StateCacheScannedVariants, stat.FilteredVariants, stat.StateCacheHits, stat.StateCacheMisses,
+				stat.StateCacheRestoreErrors, stat.VisitedVariants, stat.StateCacheLookupElapsed,
+				stat.StateCacheRestoreElapsed, stat.DependencyLookupCacheHits, stat.DependencyLookupCacheMisses,
+				stat.DependencyLookupCacheElapsed, stat.CallbackElapsed, stat.DependencyUpdateElapsed,
+				dependencyMode, stat.DependencyUpdateModules, stat.Elapsed)
+			if stat.StateCacheEnabled {
+				fmt.Fprintf(os.Stderr, "soong: mutator %s: state-cache subset=%t (actions=%t analysis=%t source-graph=%t db=%t), affected declarations=%d variants=%d unkeyed variants=%d\n",
+					name, stat.StateCacheSubsetEnabled, stat.IncrementalBuildActionsEnabled,
+					stat.IncrementalAnalysisEnabled, stat.SourceDeclarationGraphValid,
+					stat.StateCacheDatabaseAvailable, stat.AffectedSourceDeclarations,
+					stat.AffectedSourceVariants, stat.UnkeyedSourceVariants)
+			}
+		}
+	}
 
 	if len(errs) > 0 {
 		return nil, errs
@@ -3625,12 +4472,30 @@ var mutatorContextPool = pool.New[mutatorContext]()
 
 func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 	direction mutatorDirection) (deps []string, errs []error) {
+	visitStarted := time.Now()
+	var visitedVariants atomic.Uint64
+	var callbackElapsed atomic.Int64
+	var stateCacheScannedVariants atomic.Uint64
+	var filteredVariants atomic.Uint64
+	var stateCacheHits atomic.Uint64
+	var stateCacheMisses atomic.Uint64
+	var stateCacheRestores atomic.Uint64
+	var stateCacheRestoreFailures atomic.Uint64
+	var stateCacheLookupElapsed atomic.Int64
+	var stateCacheRestoreElapsed atomic.Int64
+	var affectedSourceVariants atomic.Uint64
+	var unkeyedSourceVariants atomic.Uint64
+	var dependencyLookupCacheHits atomic.Uint64
+	var dependencyLookupCacheMisses atomic.Uint64
+	var dependencyLookupCacheElapsed atomic.Int64
 
 	type globalStateChange struct {
 		reverse             []reverseDep
 		rename              []rename
 		replace             []replace
 		newModules          []*moduleInfo
+		newDirectDepModules []*moduleInfo
+		splitSources        []*moduleInfo
 		onDemandModules     []*moduleInfo
 		onDemandReverseDeps []reverseDep
 		deps                []string
@@ -3646,7 +4511,11 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 	var rename []rename
 	var replace []replace
 	var newModules []*moduleInfo
+	var newDirectDepModules []*moduleInfo
+	var splitSources []*moduleInfo
+	var splitChangedDependencyModules []*moduleInfo
 	var onDemandModules []*moduleInfo
+	dependencyUpdateGroups := make(map[*moduleGroup]struct{})
 
 	errsCh := make(chan []error)
 	globalStateCh := make(chan globalStateChange)
@@ -3654,8 +4523,172 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 	done := make(chan bool)
 
 	c.needsUpdateDependencies = 0
+	var modulesToVisit []*moduleInfo
+	var modulesToSnapshot []*moduleInfo
+	var modulesToSnapshotMu sync.Mutex
+	useIncrementalStateSubset := false
+	statelessStateCache := false
+	mutatorName := mutatorGroup[0].name
+	if len(mutatorGroup) > 1 {
+		mutatorName += "_plus_" + strconv.Itoa(len(mutatorGroup)-1)
+	}
+	stateCache := mutatorGroup[0].incrementalStateCache
+	dependencyLookupCacheVersion := mutatorGroup[0].dependencyLookupCacheVersion
+	useDependencyLookupCache := dependencyLookupCacheVersion != "" && len(mutatorGroup) == 1 &&
+		c.GetIncrementalEnabled() && c.keyValueStoreCache != nil
+	affectedDependencySources := make(map[string]struct{}, len(c.affectedSourceModuleDeclarations))
+	for _, sourceKey := range c.affectedSourceModuleDeclarations {
+		affectedDependencySources[sourceKey] = struct{}{}
+	}
+	if !c.GetIncrementalEnabled() || !c.GetIncrementalAnalysis() || c.keyValueStoreCache == nil {
+		stateCache = nil
+	}
+	stateCacheVersion := ""
+	stateCacheVersionChanged := false
+	if stateCache != nil {
+		_, statelessStateCache = stateCache.(MutatorStateCacheNoModuleState)
+		if versioned, ok := stateCache.(MutatorStateCacheVersion); ok {
+			stateCacheVersion = versioned.CacheVersion()
+			if stateCacheVersion == "" {
+				return nil, []error{fmt.Errorf("mutator %q has an empty incremental state cache version", mutatorName)}
+			}
+			if c.GetIncrementalEnabled() && c.keyValueStoreCache != nil {
+				cachedVersion, err := c.keyValueStoreCache.readMutatorStateCacheVersion(c.EncContext, mutatorName)
+				if err != nil {
+					return nil, []error{fmt.Errorf("reading incremental state cache version for mutator %q: %w", mutatorName, err)}
+				}
+				stateCacheVersionChanged = cachedVersion != stateCacheVersion
+			}
+		}
+	}
+	stateCacheShouldRun := func(module *moduleInfo) bool {
+		filter, ok := stateCache.(MutatorStateCacheModuleFilter)
+		return !ok || filter.ShouldRun(module.logicModule)
+	}
+	filterModulesToVisit := func(modules []*moduleInfo) []*moduleInfo {
+		filtered := modules[:0]
+		for _, module := range modules {
+			if c.mutatorVisitStatsEnabled {
+				stateCacheScannedVariants.Add(1)
+			}
+			if stateCacheShouldRun(module) {
+				filtered = append(filtered, module)
+			} else {
+				if c.mutatorVisitStatsEnabled {
+					filteredVariants.Add(1)
+				}
+				module.startedMutator = mutatorGroup[0].index
+				module.finishedMutator = mutatorGroup[len(mutatorGroup)-1].index
+			}
+		}
+		return filtered
+	}
+	if stateCache != nil {
+		if len(mutatorGroup) != 1 || direction.orderer() != bottomUpVisitor ||
+			mutatorGroup[0].transitionMutator != nil || mutatorGroup[0].usesRename ||
+			mutatorGroup[0].usesReverseDependencies || mutatorGroup[0].usesReplaceDependencies ||
+			mutatorGroup[0].usesCreateModule || mutatorGroup[0].mutatesDependencies ||
+			mutatorGroup[0].mutatesGlobalState {
+			return nil, []error{fmt.Errorf("mutator %q has an incremental state cache but is not module-local", mutatorName)}
+		}
+		useIncrementalStateSubset = !stateCacheVersionChanged && c.GetIncrementalEnabled() && c.GetIncrementalAnalysis() &&
+			c.sourceDeclarationGraphValid && c.keyValueStoreCache != nil
+		if !useIncrementalStateSubset {
+			modulesToVisit = filterModulesToVisit(slices.Collect(c.iterateAllVariants()))
+		} else {
+			if _, ok := stateCache.(MutatorStateCacheNoModuleState); ok {
+				selectedModules := c.modulesForSourceDeclarations(c.affectedSourceModuleDeclarations)
+				if c.mutatorVisitStatsEnabled {
+					affectedSources := make(map[string]struct{}, len(c.affectedSourceModuleDeclarations))
+					for _, sourceKey := range c.affectedSourceModuleDeclarations {
+						affectedSources[sourceKey] = struct{}{}
+					}
+					for _, module := range selectedModules {
+						if module.sourceDeclarationKey == "" {
+							unkeyedSourceVariants.Add(1)
+						} else if _, affected := affectedSources[module.sourceDeclarationKey]; affected {
+							affectedSourceVariants.Add(1)
+						}
+					}
+				}
+				modulesToVisit = filterModulesToVisit(selectedModules)
+			} else {
+				affectedSources := make(map[string]struct{}, len(c.affectedSourceModuleDeclarations))
+				for _, sourceKey := range c.affectedSourceModuleDeclarations {
+					affectedSources[sourceKey] = struct{}{}
+				}
+				for module := range c.iterateAllVariants() {
+					if c.mutatorVisitStatsEnabled {
+						stateCacheScannedVariants.Add(1)
+					}
+					if !stateCacheShouldRun(module) {
+						if c.mutatorVisitStatsEnabled {
+							filteredVariants.Add(1)
+						}
+						module.startedMutator = mutatorGroup[0].index
+						module.finishedMutator = mutatorGroup[len(mutatorGroup)-1].index
+						continue
+					}
+					if _, affected := affectedSources[module.sourceDeclarationKey]; affected {
+						if c.mutatorVisitStatsEnabled {
+							affectedSourceVariants.Add(1)
+						}
+						modulesToVisit = append(modulesToVisit, module)
+						continue
+					}
+					key := c.mutatorModuleStateCacheKey(mutatorName, module)
+					if key == nil {
+						if c.mutatorVisitStatsEnabled {
+							unkeyedSourceVariants.Add(1)
+						}
+						modulesToVisit = append(modulesToVisit, module)
+						continue
+					}
+					lookupStarted := time.Now()
+					cached, err := c.keyValueStoreCache.readMutatorModuleState(c.EncContext, key)
+					if c.mutatorVisitStatsEnabled {
+						stateCacheLookupElapsed.Add(int64(time.Since(lookupStarted)))
+					}
+					if err != nil || cached == nil || !cached.Valid || cached.Version != mutatorModuleStateCacheVersion {
+						if c.mutatorVisitStatsEnabled {
+							stateCacheMisses.Add(1)
+						}
+						modulesToVisit = append(modulesToVisit, module)
+						continue
+					}
+					restoreStarted := time.Now()
+					err = stateCache.Restore(module.logicModule, []byte(cached.State))
+					if c.mutatorVisitStatsEnabled {
+						stateCacheRestoreElapsed.Add(int64(time.Since(restoreStarted)))
+					}
+					if err != nil {
+						if c.mutatorVisitStatsEnabled {
+							restoreErrorCount := stateCacheRestoreFailures.Add(1)
+							if restoreErrorCount <= 8 {
+								fmt.Fprintf(os.Stderr, "soong: mutator %s: state-cache restore failed for module %q (%T, source=%q): %v\n",
+									mutatorName, module.logicModule.Name(), module.logicModule, module.sourceDeclarationKey, err)
+							}
+						}
+						modulesToVisit = append(modulesToVisit, module)
+						continue
+					}
+					if c.mutatorVisitStatsEnabled {
+						stateCacheHits.Add(1)
+						stateCacheRestores.Add(1)
+					}
+					module.startedMutator = mutatorGroup[0].index
+					module.finishedMutator = mutatorGroup[0].index
+				}
+			}
+		}
+	} else {
+		modulesToVisit = slices.Collect(c.iterateAllVariants())
+	}
 
 	visit := func(module *moduleInfo, pause pauseFunc) bool {
+		if c.mutatorVisitStatsEnabled {
+			visitedVariants.Add(1)
+		}
 		if module.splitModules != nil {
 			panic("split module found in sorted module list")
 		}
@@ -3691,6 +4724,21 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 			mutator:   mutatorGroup[0],
 			pauseFunc: pause,
 		}
+		if useDependencyLookupCache {
+			key := c.dependencyResolutionCacheKey(mutatorName, dependencyLookupCacheVersion, module)
+			if key != nil {
+				_, affected := affectedDependencySources[module.sourceDeclarationKey]
+				mctx.dependencyResolutionCache = &dependencyResolutionCache{
+					key:         key,
+					readAllowed: c.GetIncrementalAnalysis() && c.sourceDeclarationGraphValid && !affected,
+				}
+				if c.mutatorVisitStatsEnabled {
+					mctx.dependencyResolutionCache.hits = &dependencyLookupCacheHits
+					mctx.dependencyResolutionCache.misses = &dependencyLookupCacheMisses
+					mctx.dependencyResolutionCache.elapsed = &dependencyLookupCacheElapsed
+				}
+			}
+		}
 
 		module.startedMutator = mutatorGroup[0].index
 
@@ -3706,8 +4754,18 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 					}
 				}
 			}()
+			callbackStarted := time.Now()
 			direction.run(mutatorGroup, mctx)
+			if c.mutatorVisitStatsEnabled {
+				callbackElapsed.Add(int64(time.Since(callbackStarted)))
+			}
 		}()
+		if stateCache != nil && (len(mctx.reverseDeps) != 0 || len(mctx.rename) != 0 ||
+			len(mctx.replace) != 0 || len(mctx.newVariations) != 0 || len(mctx.newModules) != 0 ||
+			len(module.newDirectDeps) != 0 || module.splitModules != nil ||
+			len(module.newOnDemandReverseDeps) != 0 || len(mctx.ninjaFileDeps) != 0) {
+			mctx.error(fmt.Errorf("mutator %q violated its module-local incremental state contract", mutatorName))
+		}
 
 		module.finishedMutator = mutatorGroup[len(mutatorGroup)-1].index
 
@@ -3716,12 +4774,32 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 			errsCh <- mctx.errs
 			hasErrors = true
 		} else {
-			if len(mctx.reverseDeps) > 0 || len(mctx.replace) > 0 || len(mctx.rename) > 0 || len(mctx.newModules) > 0 || len(mctx.ninjaFileDeps) > 0 || len(mctx.module.newOnDemandReverseDeps) > 0 {
+			if cache := mctx.dependencyResolutionCache; cache != nil && cache.dirty {
+				if state, err := json.Marshal(cache.entries); err == nil {
+					module.pendingDependencyResolutionCache = string(state)
+				}
+			}
+			if stateCache != nil && !statelessStateCache && c.GetIncrementalEnabled() && c.keyValueStoreCache != nil {
+				modulesToSnapshotMu.Lock()
+				modulesToSnapshot = append(modulesToSnapshot, module)
+				modulesToSnapshotMu.Unlock()
+			}
+			var modulesWithNewDirectDeps []*moduleInfo
+			if len(module.newDirectDeps) > 0 {
+				modulesWithNewDirectDeps = []*moduleInfo{module}
+			}
+			var modulesWithSplits []*moduleInfo
+			if module.splitModules != nil {
+				modulesWithSplits = []*moduleInfo{module}
+			}
+			if len(mctx.reverseDeps) > 0 || len(mctx.replace) > 0 || len(mctx.rename) > 0 || len(mctx.newModules) > 0 || len(module.newDirectDeps) > 0 || module.splitModules != nil || len(mctx.ninjaFileDeps) > 0 || len(mctx.module.newOnDemandReverseDeps) > 0 {
 				globalStateCh <- globalStateChange{
 					reverse:             mctx.reverseDeps,
 					replace:             mctx.replace,
 					rename:              mctx.rename,
 					newModules:          mctx.newModules,
+					newDirectDepModules: modulesWithNewDirectDeps,
+					splitSources:        modulesWithSplits,
 					deps:                mctx.ninjaFileDeps,
 					onDemandReverseDeps: module.newOnDemandReverseDeps,
 				}
@@ -3734,6 +4812,9 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 			mctx.storeCoreModuleInfo()
 		}
 
+		// The serialized cache state is retained on module until the pass finishes;
+		// do not also keep the in-memory request map alive in the pooled context.
+		mctx.dependencyResolutionCache = nil
 		mutatorContextPool.Put(mctx)
 		mctx = nil
 
@@ -3765,6 +4846,8 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 				replace = append(replace, globalStateChange.replace...)
 				rename = append(rename, globalStateChange.rename...)
 				newModules = append(newModules, globalStateChange.newModules...)
+				newDirectDepModules = append(newDirectDepModules, globalStateChange.newDirectDepModules...)
+				splitSources = append(splitSources, globalStateChange.splitSources...)
 				onDemandModules = append(onDemandModules, globalStateChange.onDemandModules...)
 				deps = append(deps, globalStateChange.deps...)
 			case createdOnDemandStateChange := <-createdOnDemandStateCh:
@@ -3790,8 +4873,41 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 		}
 	}()
 
-	visitErrs := parallelVisit(c.iterateAllVariants(), direction.orderer(), parallelVisitLimit, visit)
-
+	var visitErrs []error
+	if stateCache != nil {
+		if len(modulesToVisit) != 0 {
+			visitErrs = parallelVisitSubset(modulesToVisit, unorderedVisitorImpl{}, parallelVisitLimit, visit)
+		}
+	} else {
+		visitErrs = parallelVisit(slices.Values(modulesToVisit), direction.orderer(), parallelVisitLimit, visit)
+	}
+	if c.mutatorVisitStatsEnabled {
+		c.mutatorVisitStats[mutatorName] = MutatorVisitStats{
+			StateCacheEnabled:              stateCache != nil,
+			StateCacheSubsetEnabled:        useIncrementalStateSubset,
+			IncrementalBuildActionsEnabled: c.GetIncrementalEnabled(),
+			IncrementalAnalysisEnabled:     c.GetIncrementalAnalysis(),
+			SourceDeclarationGraphValid:    c.sourceDeclarationGraphValid,
+			StateCacheDatabaseAvailable:    c.keyValueStoreCache != nil,
+			AffectedSourceDeclarations:     uint64(len(c.affectedSourceModuleDeclarations)),
+			AffectedSourceVariants:         affectedSourceVariants.Load(),
+			UnkeyedSourceVariants:          unkeyedSourceVariants.Load(),
+			StateCacheScannedVariants:      stateCacheScannedVariants.Load(),
+			FilteredVariants:               filteredVariants.Load(),
+			StateCacheHits:                 stateCacheHits.Load(),
+			StateCacheMisses:               stateCacheMisses.Load(),
+			StateCacheRestores:             stateCacheRestores.Load(),
+			StateCacheRestoreErrors:        stateCacheRestoreFailures.Load(),
+			VisitedVariants:                visitedVariants.Load(),
+			StateCacheLookupElapsed:        time.Duration(stateCacheLookupElapsed.Load()),
+			StateCacheRestoreElapsed:       time.Duration(stateCacheRestoreElapsed.Load()),
+			DependencyLookupCacheHits:      dependencyLookupCacheHits.Load(),
+			DependencyLookupCacheMisses:    dependencyLookupCacheMisses.Load(),
+			DependencyLookupCacheElapsed:   time.Duration(dependencyLookupCacheElapsed.Load()),
+			CallbackElapsed:                time.Duration(callbackElapsed.Load()),
+			Elapsed:                        time.Since(visitStarted),
+		}
+	}
 	if len(visitErrs) > 0 {
 		return nil, visitErrs
 	}
@@ -3809,41 +4925,14 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 	transitionMutator := mutatorGroup[0].transitionMutator
 
 	if transitionMutator != nil {
-		for _, group := range c.moduleGroups {
-			for i := 0; i < len(group.modules); i++ {
-				module := group.modules[i]
-
-				// Update module group to contain newly split variants
-				if module.splitModules != nil {
-					group.modules, i = spliceModules(group.modules, i, module.splitModules)
-				}
-
-				// Fix up any remaining dependencies on modules that were split into variants
-				// by replacing them with the first variant
-				for j, dep := range module.directDeps {
-					if dep.module.obsoletedByNewVariants {
-						module.directDeps[j].module = dep.module.splitModules.firstModule()
-					}
-				}
-
-				if module.createdBy != nil && module.createdBy.obsoletedByNewVariants {
-					module.createdBy = module.createdBy.splitModules.firstModule()
-				}
-			}
+		for _, source := range splitSources {
+			dependencyUpdateGroups[source.group] = struct{}{}
 		}
+		splitChangedDependencyModules = c.updateSplitVariantReferences(splitSources, newDirectDepModules)
 
 		c.completedTransitionMutators = transitionMutator.index + 1
 	} else {
-		for _, group := range c.moduleGroups {
-			for _, module := range group.modules {
-				// Add any new forward dependencies to the reverse dependencies of the dependency to avoid
-				// having to call a full c.updateDependencies().
-				for _, m := range module.newDirectDeps {
-					m.reverseDeps = append(m.reverseDeps, module)
-				}
-				module.newDirectDeps = nil
-			}
-		}
+		updateReverseDepsForNewDirectDeps(newDirectDepModules)
 	}
 
 	// Add in any new reverse dependencies that were added by the mutator
@@ -3882,16 +4971,45 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 		return nil, errs
 	}
 
-	errs = c.handleReplacements(replace)
+	changedDependencyModules, replacementErrs := c.handleReplacements(replace)
+	errs = replacementErrs
 	if len(errs) > 0 {
 		return nil, errs
 	}
 
+	var dependencyUpdateElapsed time.Duration
+	var dependencyUpdateModules uint64
+	var fullDependencyRefresh bool
 	if c.needsUpdateDependencies > 0 {
-		errs = c.updateDependencies()
-		if len(errs) > 0 {
-			return nil, errs
+		modulesToUpdate := append([]*moduleInfo(nil), changedDependencyModules...)
+		modulesToUpdate = append(modulesToUpdate, splitChangedDependencyModules...)
+		for _, group := range c.moduleGroups {
+			if _, affected := dependencyUpdateGroups[group]; affected {
+				modulesToUpdate = append(modulesToUpdate, group.modules...)
+			}
 		}
+		dependencyUpdateModules = uint64(len(modulesToUpdate))
+		dependencyUpdateStarted := time.Now()
+		if !c.GetIncrementalEnabled() || !c.GetIncrementalAnalysis() || len(modulesToUpdate) == 0 {
+			fullDependencyRefresh = true
+			// Preserve the conservative path if a future dependency mutation
+			// increments needsUpdateDependencies without identifying its scope,
+			// and keep non-incremental builds on the original full graph refresh.
+			errs = c.updateDependencies()
+			if len(errs) > 0 {
+				return nil, errs
+			}
+		} else {
+			c.updateDependenciesForModules(modulesToUpdate)
+		}
+		dependencyUpdateElapsed = time.Since(dependencyUpdateStarted)
+	}
+	if c.mutatorVisitStatsEnabled {
+		stats := c.mutatorVisitStats[mutatorName]
+		stats.DependencyUpdateModules = dependencyUpdateModules
+		stats.FullDependencyRefresh = fullDependencyRefresh
+		stats.DependencyUpdateElapsed = dependencyUpdateElapsed
+		c.mutatorVisitStats[mutatorName] = stats
 	}
 
 	// Add the on-demand variant into its module group.
@@ -3917,6 +5035,7 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 			}
 		}
 		module.group.modules = slices.Insert(module.group.modules, insertIndex, module)
+		module.group.invalidateVariantLookupCaches()
 	}
 
 	moduleGroupsWithOnDemandModules := make(map[*moduleGroup]bool)
@@ -3952,6 +5071,45 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 		slices.SortStableFunc(g.modules, func(a, b *moduleInfo) int {
 			return cmp.Compare(a.sortIndex, b.sortIndex)
 		})
+	}
+
+	if stateCache != nil && !statelessStateCache && c.GetIncrementalEnabled() && c.keyValueStoreCache != nil {
+		for _, module := range modulesToSnapshot {
+			key := c.mutatorModuleStateCacheKey(mutatorName, module)
+			if key == nil {
+				continue
+			}
+			state, err := stateCache.Snapshot(module.logicModule)
+			cached := &MutatorModuleStateCachedData{Version: mutatorModuleStateCacheVersion, Valid: err == nil}
+			if err == nil {
+				cached.State = string(state)
+			}
+			if err := c.keyValueStoreCache.writeMutatorModuleState(c.EncContext, key, cached); err != nil {
+				return nil, []error{fmt.Errorf("caching state for mutator %q and module %q: %w", mutatorName, module, err)}
+			}
+		}
+	}
+	if stateCacheVersion != "" && c.GetIncrementalEnabled() && c.keyValueStoreCache != nil {
+		if err := c.keyValueStoreCache.writeMutatorStateCacheVersion(c.EncContext, mutatorName, stateCacheVersion); err != nil {
+			return nil, []error{fmt.Errorf("caching incremental state cache version for mutator %q: %w", mutatorName, err)}
+		}
+	}
+	if useDependencyLookupCache {
+		for _, module := range modulesToVisit {
+			state := module.pendingDependencyResolutionCache
+			module.pendingDependencyResolutionCache = ""
+			if state == "" {
+				continue
+			}
+			key := c.dependencyResolutionCacheKey(mutatorName, dependencyLookupCacheVersion, module)
+			if key == nil {
+				continue
+			}
+			if err := c.keyValueStoreCache.writeDependencyResolution(c.EncContext, key, state); err != nil {
+				fmt.Fprintf(os.Stderr, "soong: mutator %s: ignoring dependency lookup cache write failure for module %q: %v\n",
+					mutatorName, module.logicModule.Name(), err)
+			}
+		}
 	}
 
 	return deps, errs
@@ -4130,6 +5288,9 @@ func (c *Context) WriteIncrementalDebugInfo(filename string, modules []*moduleIn
 	f.WriteString("{\n\"modules\": [\n")
 
 	for _, module := range modules {
+		if c.incrementalDebugMissesOnly && module.incrementalRestored {
+			continue
+		}
 		if module.incrementalDebugInfo == nil {
 			continue
 		}
@@ -4184,26 +5345,9 @@ func (c *Context) generateOneSingletonBuildActions(config interface{},
 		if !info.incrementalRestored || c.incrementalProviderTest {
 			info.singleton.GenerateBuildActions(sctx)
 		}
-		// A caching entry for singletons is only written if the singleton
-		// depends on at least one provider. If zero providers are consumed,
-		// the cache restore process would fail to locate
-		// a cache entry, forcing the singleton to re-execute on every build.
-		//
-		// An edge case where a coding change removes a provider dependency is safely handled
-		// because any detected code change automatically invalidates the entire global cache,
-		// ensuring system consistency.
+		// An edge case where a coding change removes a dependency is safely handled because
+		// detected code changes automatically invalidate the entire global cache.
 		if info.buildActionCacheKey != nil && !info.incrementalRestored {
-			cache := make(map[int]proptools.Hash)
-			for k, _ := range sctx.depProviders {
-				// A singleton might depend on both module providers and singleton providers, and
-				// the hashes of all the former are stored in context globally, and the hashes of
-				// the latter are stored inside the current singletonInfo.
-				if providerRegistry[k].mutator == singletonTag {
-					cache[k] = info.providerValueHashes[k]
-				} else {
-					cache[k] = c.providerValueHashes[k]
-				}
-			}
 
 			var providerHashes []ProviderHash
 			for i, p := range info.providers {
@@ -4226,9 +5370,14 @@ func (c *Context) generateOneSingletonBuildActions(config interface{},
 
 			if err := c.keyValueStoreCache.writeSingletonBuildAction(c.EncContext, info.buildActionCacheKey,
 				&SingletonActionCachedData{
-					ProviderHashes:           providerHashes,
-					DependencyProviderHashes: cache,
-					GlobCache:                info.globCache,
+					CacheVersion:                    singletonActionCacheVersion,
+					ProviderHashes:                  providerHashes,
+					ModuleDependencyBloom:           sctx.moduleDependencyBloom,
+					ModuleProviderDependencyBitsets: sctx.cachedModuleProviderDependencyBitsets(),
+					ModuleSetHash:                   sctx.moduleSetHash,
+					SingletonProviderDependencies:   sctx.singletonProviderDependencies,
+					SingletonSetHash:                sctx.singletonSetHash,
+					GlobCache:                       info.globCache,
 				}); err != nil {
 				panic(err)
 			}
@@ -4275,17 +5424,42 @@ func (c *Context) restoreSingleton(info *singletonInfo) {
 		return
 	}
 
-	// This logic here assumes a singleton's behavior is a pure function of its providers.
-	// Conditional access to certain providers must also be based on other provider
-	// values, ensuring that any behavioral change is captured by the input providers hashes.
-	for k, v := range data.DependencyProviderHashes {
-		var hash proptools.Hash
-		if providerRegistry[k].mutator == singletonTag {
-			hash = info.providerValueHashes[k]
-		} else {
-			hash = c.providerValueHashes[k]
+	if data.CacheVersion != singletonActionCacheVersion {
+		return
+	}
+
+	if data.ModuleSetHash != "" && data.ModuleSetHash != c.incrementalModuleSetHash {
+		return
+	}
+	for _, key := range c.incrementalChangedModuleCacheKeys {
+		if moduleDependencyBloomMayContain(data.ModuleDependencyBloom, key) {
+			return
 		}
-		if hash != v {
+	}
+	for _, dependency := range c.incrementalChangedModuleProviders {
+		moduleIndex, ok := c.incrementalModuleIndexByCacheKey[dependency.moduleKey]
+		if !ok {
+			return
+		}
+		for _, bitset := range data.ModuleProviderDependencyBitsets {
+			if bitset.ProviderId == dependency.providerId && moduleIndex/64 < len(bitset.Modules) && bitset.Modules[moduleIndex/64]&(uint64(1)<<(moduleIndex%64)) != 0 {
+				return
+			}
+		}
+	}
+	if data.SingletonSetHash != "" && data.SingletonSetHash != c.finishedSingletonSetHash() {
+		return
+	}
+	for _, dependency := range data.SingletonProviderDependencies {
+		dependencySingleton := c.singletonByName(dependency.SingletonName)
+		if dependencySingleton == nil {
+			return
+		}
+		var hash proptools.Hash
+		if dependency.ProviderId >= 0 && dependency.ProviderId < len(dependencySingleton.providerInitialValueHashes) {
+			hash = dependencySingleton.providerInitialValueHashes[dependency.ProviderId]
+		}
+		if hash != dependency.Hash {
 			return
 		}
 	}
@@ -4365,31 +5539,121 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
 	return deps, errs
 }
 
-func (c *Context) calculateProvidersHashes() {
-	c.providerValueHashes = make([]proptools.Hash, len(providerRegistry))
-	var wg sync.WaitGroup
-	for i := range len(providerRegistry) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			var providerHashes []proptools.Hash
-			// For singleton providers we collect provider hashes from singletons.
-			if providerRegistry[i].mutator != singletonTag {
-				c.visitAllModuleInfos(func(m *moduleInfo) {
-					if m.providerInitialValueHashes != nil {
-						providerHashes = append(providerHashes, m.providerInitialValueHashes[i])
-					}
-				})
+func (c *Context) prepareSingletonDependencyState() {
+	changed := make([]string, 0)
+	changedProviders := make([]moduleProviderDependency, 0)
+	moduleCacheKeys := make(map[*moduleInfo]string)
+	moduleKeys := make([]string, 0)
+	moduleKeysBySource := make(map[string]map[string]struct{})
+	dependentsBySource := make(map[string]map[string]struct{})
+	globCachesBySource := make(map[string][]globResultCache)
+	sourceDeclarationGraphComplete := true
+	c.visitAllModuleInfos(func(module *moduleInfo) {
+		key := module.moduleCacheKey()
+		moduleCacheKeys[module] = key
+		moduleKeys = append(moduleKeys, key)
+		if module.sourceDeclarationKey != "" {
+			if moduleKeysBySource[module.sourceDeclarationKey] == nil {
+				moduleKeysBySource[module.sourceDeclarationKey] = make(map[string]struct{})
 			}
-			var err error
-			c.providerValueHashes[i], err = proptools.CalculateHash(hashList(providerHashes))
-			if err != nil {
-				panic(err)
+			moduleKeysBySource[module.sourceDeclarationKey][key] = struct{}{}
+			for _, glob := range module.globCache {
+				excludes := slices.Clone(glob.Excludes)
+				slices.Sort(excludes)
+				glob.Excludes = excludes
+				if !slices.ContainsFunc(globCachesBySource[module.sourceDeclarationKey], func(existing globResultCache) bool {
+					return existing.Pattern == glob.Pattern && slices.Equal(existing.Excludes, glob.Excludes)
+				}) {
+					globCachesBySource[module.sourceDeclarationKey] = append(globCachesBySource[module.sourceDeclarationKey], glob)
+				}
 			}
-		}()
+		}
+		for _, dep := range module.directDeps {
+			if dep.module.sourceDeclarationKey == "" {
+				if module.sourceDeclarationKey != "" {
+					sourceDeclarationGraphComplete = false
+				}
+				continue
+			}
+			if module.sourceDeclarationKey == "" {
+				sourceDeclarationGraphComplete = false
+				continue
+			}
+			if module.sourceDeclarationKey == dep.module.sourceDeclarationKey {
+				continue
+			}
+			if dependentsBySource[dep.module.sourceDeclarationKey] == nil {
+				dependentsBySource[dep.module.sourceDeclarationKey] = make(map[string]struct{})
+			}
+			dependentsBySource[dep.module.sourceDeclarationKey][module.sourceDeclarationKey] = struct{}{}
+		}
+		if !module.incrementalRestored {
+			changed = append(changed, key)
+			for providerId := range providerRegistry {
+				currentHash := proptools.ZeroHash
+				if providerId < len(module.providerInitialValueHashes) {
+					currentHash = module.providerInitialValueHashes[providerId]
+				}
+				if !module.hasCachedProviderInitialValueHashes ||
+					providerId >= len(module.cachedProviderInitialValueHashes) ||
+					module.cachedProviderInitialValueHashes[providerId] != currentHash {
+					changedProviders = append(changedProviders, moduleProviderDependency{
+						moduleKey:  key,
+						providerId: providerId,
+					})
+				}
+			}
+		}
+	})
+	slices.Sort(moduleKeys)
+	hash := sha256.New()
+	moduleIndexes := make(map[string]int, len(moduleKeys))
+	for moduleIndex, key := range moduleKeys {
+		moduleIndexes[key] = moduleIndex
+		_, _ = io.WriteString(hash, key)
+		_, _ = hash.Write([]byte{0})
 	}
-	wg.Wait()
+	c.incrementalModuleSetHash = fmt.Sprintf("%x", hash.Sum(nil))
+	c.incrementalChangedModuleCacheKeys = changed
+	c.incrementalChangedModuleProviders = changedProviders
+	c.incrementalModuleCacheKeyByInfo = moduleCacheKeys
+	c.sourceDeclarationModuleCacheKeys = make(map[string][]string, len(moduleKeysBySource))
+	for sourceKey, moduleKeys := range moduleKeysBySource {
+		for moduleKey := range moduleKeys {
+			c.sourceDeclarationModuleCacheKeys[sourceKey] = append(c.sourceDeclarationModuleCacheKeys[sourceKey], moduleKey)
+		}
+		sort.Strings(c.sourceDeclarationModuleCacheKeys[sourceKey])
+	}
+	c.sourceDeclarationDependents = make(map[string][]string, len(dependentsBySource))
+	for sourceKey, dependents := range dependentsBySource {
+		for dependent := range dependents {
+			c.sourceDeclarationDependents[sourceKey] = append(c.sourceDeclarationDependents[sourceKey], dependent)
+		}
+		sort.Strings(c.sourceDeclarationDependents[sourceKey])
+	}
+	c.sourceDeclarationGlobs = globCachesBySource
+	c.sourceDeclarationGraphComplete = sourceDeclarationGraphComplete
+	c.incrementalModuleIndexByCacheKey = moduleIndexes
+	c.incrementalModuleIndexByInfo = make(map[*moduleInfo]int, len(moduleCacheKeys))
+	for module, key := range moduleCacheKeys {
+		c.incrementalModuleIndexByInfo[module] = moduleIndexes[key]
+	}
+	c.incrementalModuleBloomWords = moduleDependencyBloomWords(len(moduleKeys))
+	c.incrementalModuleBitsetWords = (len(moduleKeys) + 63) / 64
+	if c.incrementalModuleBitsetWords == 0 {
+		c.incrementalModuleBitsetWords = 1
+	}
+}
+
+func (c *Context) finishedSingletonSetHash() string {
+	hash := sha256.New()
+	for _, singleton := range c.singletonInfo {
+		if singleton.finishedGenerateBuildActions {
+			_, _ = io.WriteString(hash, singleton.name)
+			_, _ = hash.Write([]byte{0})
+		}
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil))
 }
 
 func (c *Context) generateSingletonBuildActions(config interface{},
@@ -4415,7 +5679,7 @@ func (c *Context) generateSingletonBuildActions(config interface{},
 	c.sortedModuleGroups()
 
 	if c.GetIncrementalEnabled() {
-		c.calculateProvidersHashes()
+		c.prepareSingletonDependencyState()
 	}
 
 	// First, take care of any singletons that want to run in parallel.
@@ -4423,29 +5687,6 @@ func (c *Context) generateSingletonBuildActions(config interface{},
 
 	for _, info := range singletons {
 		if !info.parallel {
-			if c.GetIncrementalEnabled() {
-				// A singleton might depend on modules and other singletons that run before it.
-				// We already captured the provider hashes of all the modules in calculateProvidersHashes,
-				// now we calculate the hashes of all singletons that the current one might depend on.
-				info.providerValueHashes = make([]proptools.Hash, len(providerRegistry))
-				for i := range len(providerRegistry) {
-					var providerHashes []proptools.Hash
-					if providerRegistry[i].mutator == singletonTag {
-						c.VisitAllSingletons(func(s SingletonProxy) {
-							hash := proptools.ZeroHash
-							if s.singleton.providerInitialValueHashes != nil {
-								hash = s.singleton.providerInitialValueHashes[i]
-							}
-							providerHashes = append(providerHashes, hash)
-						})
-					}
-					var err error
-					info.providerValueHashes[i], err = proptools.CalculateHash(hashList(providerHashes))
-					if err != nil {
-						panic(err)
-					}
-				}
-			}
 			runSingleton(info)
 			if len(errs) > maxErrors {
 				break
@@ -4583,19 +5824,25 @@ func (c *Context) handleRenames(renames []rename) []error {
 	return errs
 }
 
-func (c *Context) handleReplacements(replacements []replace) []error {
+func (c *Context) handleReplacements(replacements []replace) ([]*moduleInfo, []error) {
 	var errs []error
 	changedDeps := false
+	var changedModules []*moduleInfo
 	for _, replace := range replacements {
 		for _, m := range replace.from.reverseDeps {
+			moduleChanged := false
 			for i, d := range m.directDeps {
 				if d.module == replace.from {
 					// If the replacement has a predicate then check it.
 					if replace.predicate == nil || replace.predicate(m.logicModule, d.tag, d.module.logicModule) {
 						m.directDeps[i].module = replace.to
 						changedDeps = true
+						moduleChanged = true
 					}
 				}
+			}
+			if moduleChanged {
+				changedModules = append(changedModules, m)
 			}
 		}
 
@@ -4604,7 +5851,7 @@ func (c *Context) handleReplacements(replacements []replace) []error {
 	if changedDeps {
 		c.needsUpdateDependencies++
 	}
-	return errs
+	return changedModules, errs
 }
 
 func (c *Context) discoveredMissingDependencies(module *moduleInfo, depName string, depVariations variationMap) (errs []error) {
@@ -5331,7 +6578,12 @@ func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFil
 			return
 		}
 
-		if err = c.writeAllSingletonActions(nw); err != nil {
+		if shardNinja {
+			err = c.writeAllSingletonActionsToShards(nw, ninjaFileName)
+		} else {
+			err = c.writeAllSingletonActions(nw)
+		}
+		if err != nil {
 			return
 		}
 	})
@@ -5577,13 +6829,187 @@ func GetNinjaShardFiles(ninjaFile string) []string {
 		panic(fmt.Errorf("ninja file name in wrong format : %s", ninjaFile))
 	}
 	base := strings.TrimSuffix(ninjaFile, suffix)
-	ninjaShardCnt := 10
-	fileNames := make([]string, ninjaShardCnt)
+	fileNames := make([]string, ninjaShardCount)
 
-	for i := 0; i < ninjaShardCnt; i++ {
+	for i := 0; i < ninjaShardCount; i++ {
 		fileNames[i] = fmt.Sprintf("%s.%d%s", base, i, suffix)
 	}
 	return fileNames
+}
+
+const ninjaSingletonShardCount = 256
+
+func GetNinjaSingletonShardFiles(ninjaFile string) []string {
+	suffix := ".ninja"
+	if !strings.HasSuffix(ninjaFile, suffix) {
+		panic(fmt.Errorf("ninja file name in wrong format : %s", ninjaFile))
+	}
+	base := strings.TrimSuffix(ninjaFile, suffix)
+	fileNames := make([]string, ninjaSingletonShardCount)
+	for i := range fileNames {
+		fileNames[i] = fmt.Sprintf("%s.singleton.%d%s", base, i, suffix)
+	}
+	return fileNames
+}
+
+// 8192 stable buckets give module-action updates smaller write units without
+// creating one Ninja manifest per Blueprint package.
+const ninjaShardCount = 8192
+
+const ninjaShardWriteConcurrency = 8
+
+const ninjaShardCacheVersion = 2
+
+type ninjaShardCacheRecord struct {
+	Version      int    `json:"version"`
+	Fingerprint  string `json:"fingerprint"`
+	Size         int64  `json:"size"`
+	ModTimeNanos int64  `json:"mod_time_nanos"`
+}
+
+func GetNinjaShardCacheFile(ninjaShardFile string) string {
+	return ninjaShardFile + ".blueprint-cache"
+}
+
+// shardModulesByStableModuleID keeps all variants of a module in one shard.
+// Hashing the stable module identity distributes large Blueprint packages
+// without moving existing modules when another module is added or removed.
+func shardModulesByStableModuleID(modules []*moduleInfo, shardCount int) [][]*moduleInfo {
+	shards := make([][]*moduleInfo, shardCount)
+	for _, module := range modules {
+		shard := stableNinjaShardIndex(moduleShardIdentity(module), shardCount)
+		shards[shard] = append(shards[shard], module)
+	}
+	return shards
+}
+
+func moduleShardIdentity(module *moduleInfo) string {
+	if cacheIdentity, ok := module.logicModule.(ModuleActionCacheIdentity); ok {
+		return module.relBlueprintsFile + "\x00" + cacheIdentity.ModuleActionCacheIdentity() + "\x00" + module.typeName
+	}
+	return filepath.Dir(module.relBlueprintsFile) + "\x00" + module.cachedUniqueName + "\x00" + module.typeName
+}
+
+func stableNinjaShardIndex(identity string, shardCount int) int {
+	hash := fnv.New32a()
+	_, _ = io.WriteString(hash, identity)
+	return int(hash.Sum32() % uint32(shardCount))
+}
+
+// shardPhonyBuildDefsByStableOutput keeps common order-only phony rules in the
+// same stable shard when unrelated rules are added or removed.
+func shardPhonyBuildDefsByStableOutput(defs []*buildDef, shardCount int) [][]*buildDef {
+	shards := make([][]*buildDef, shardCount)
+	for _, def := range defs {
+		identity := strings.Join(def.OutputStrings, "\x00")
+		shard := stableNinjaShardIndex(identity, shardCount)
+		shards[shard] = append(shards[shard], def)
+	}
+	for _, shard := range shards {
+		sort.Slice(shard, func(i, j int) bool {
+			return strings.Join(shard[i].OutputStrings, "\x00") < strings.Join(shard[j].OutputStrings, "\x00")
+		})
+	}
+	return shards
+}
+
+// incrementalNinjaShardFingerprint fingerprints the action inputs that
+// determine each shard. It can be recorded after a fresh build-action
+// generation, which lets the next incremental run reuse unchanged shards.
+func (c *Context) incrementalNinjaShardFingerprint(modules []*moduleInfo, phonys []*buildDef) (string, bool) {
+	if !c.GetIncrementalEnabled() || c.incrementalProviderTest {
+		return "", false
+	}
+	hash := sha256.New()
+	for _, module := range modules {
+		if module.buildActionCacheKey == nil {
+			return "", false
+		}
+		key := module.moduleCacheKey()
+		_, _ = io.WriteString(hash, key)
+		_, _ = hash.Write([]byte{0})
+		_, _ = io.WriteString(hash, fmt.Sprintf("%x", module.buildActionInputHash))
+		_, _ = hash.Write([]byte{0})
+
+		globCache := append([]globResultCache(nil), module.globCache...)
+		slices.SortFunc(globCache, func(a, b globResultCache) int {
+			if result := cmp.Compare(a.Pattern, b.Pattern); result != 0 {
+				return result
+			}
+			if result := cmp.Compare(strings.Join(a.Excludes, "\x00"), strings.Join(b.Excludes, "\x00")); result != 0 {
+				return result
+			}
+			return cmp.Compare(a.Result[0], b.Result[0])
+		})
+		for _, glob := range globCache {
+			_, _ = io.WriteString(hash, glob.Pattern)
+			_, _ = hash.Write([]byte{0})
+			for _, exclude := range glob.Excludes {
+				_, _ = io.WriteString(hash, exclude)
+				_, _ = hash.Write([]byte{0})
+			}
+			_, _ = io.WriteString(hash, fmt.Sprintf("%x", glob.Result))
+			_, _ = hash.Write([]byte{0xff})
+		}
+		_, _ = hash.Write([]byte{0xff})
+	}
+
+	phonyBuffer := bufio.NewWriterSize(hash, 4096)
+	phonyWriter := newNinjaWriter(phonyBuffer)
+	for _, phony := range phonys {
+		if err := phony.WriteTo(phonyWriter, c.nameTracker); err != nil {
+			return "", false
+		}
+	}
+	if err := phonyBuffer.Flush(); err != nil {
+		return "", false
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), true
+}
+
+func (c *Context) ninjaShardCacheMatches(shardFile, fingerprint string) bool {
+	markerFile := GetNinjaShardCacheFile(shardFile)
+	marker, err := c.fs.Open(markerFile)
+	if err != nil {
+		return false
+	}
+	data, readErr := io.ReadAll(marker)
+	closeErr := marker.Close()
+	if readErr != nil || closeErr != nil {
+		return false
+	}
+	var record ninjaShardCacheRecord
+	if json.Unmarshal(data, &record) != nil || record.Version != ninjaShardCacheVersion || record.Fingerprint != fingerprint {
+		return false
+	}
+	info, err := c.fs.Stat(shardFile)
+	if err != nil {
+		return false
+	}
+	return record.Size == info.Size() && record.ModTimeNanos == info.ModTime().UnixNano()
+}
+
+func (c *Context) writeNinjaShardCacheRecord(shardFile, fingerprint string) error {
+	info, err := c.fs.Stat(shardFile)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(ninjaShardCacheRecord{
+		Version:      ninjaShardCacheVersion,
+		Fingerprint:  fingerprint,
+		Size:         info.Size(),
+		ModTimeNanos: info.ModTime().UnixNano(),
+	})
+	if err != nil {
+		return err
+	}
+	marker, err := c.fs.OpenFile(GetNinjaShardCacheFile(shardFile), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, OutFilePermissions)
+	if err != nil {
+		return err
+	}
+	_, writeErr := marker.Write(data)
+	closeErr := marker.Close()
+	return errors.Join(writeErr, closeErr)
 }
 
 func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaFileName string) error {
@@ -5622,44 +7048,87 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 		})
 	})
 
-	if err := c.writeLocalBuildActions(nw, phonys); err != nil {
-		return err
-	}
-
 	if shardNinja {
+		// In sharded mode the common phony edges are distributed with module
+		// actions so a small dependency-set change does not rewrite the large root
+		// manifest.
+		if err := c.writeLocalBuildActions(nw, &localBuildActions{}); err != nil {
+			return err
+		}
+
 		var wg sync.WaitGroup
-		errorCh := make(chan error)
 		files := GetNinjaShardFiles(ninjaFileName)
-		shardedModules := proptools.ShardByCount(modules, len(files))
+		errorCh := make(chan error, len(files))
+		writeSlots := make(chan struct{}, ninjaShardWriteConcurrency)
+		var cacheableShards atomic.Uint64
+		var reusedShards atomic.Uint64
+		var contentChangedShards atomic.Uint64
+		var contentUnchangedShards atomic.Uint64
+		var shardBytesWritten atomic.Uint64
+		shardWriterPool := sync.Pool{
+			New: func() any { return bufio.NewWriterSize(io.Discard, 1024*1024) },
+		}
+		shardedModules := shardModulesByStableModuleID(modules, len(files))
+		shardedPhonys := shardPhonyBuildDefsByStableOutput(phonys.buildDefs, len(files))
+		var cacheableModules, restoredModules uint64
+		for _, module := range modules {
+			if module.buildActionCacheKey != nil {
+				cacheableModules++
+			}
+			if module.incrementalRestored {
+				restoredModules++
+			}
+		}
 		for i, batchModules := range shardedModules {
 			file := files[i]
+			batchPhonys := shardedPhonys[i]
+			writeSlots <- struct{}{}
 			wg.Add(1)
-			go func(file string, batchModules []*moduleInfo) {
+			go func(file string, batchModules []*moduleInfo, batchPhonys []*buildDef) {
 				defer wg.Done()
-				f, err := pathtools.OpenWithTruncateOnClose(c.fs, JoinPath(c.SrcDir(), file))
+				defer func() { <-writeSlots }()
+				shardFile := JoinPath(c.SrcDir(), file)
+				fingerprint, canReuse := c.incrementalNinjaShardFingerprint(batchModules, batchPhonys)
+				if canReuse {
+					cacheableShards.Add(1)
+				}
+				if canReuse && c.GetIncrementalAnalysis() && c.ninjaShardCacheMatches(shardFile, fingerprint) {
+					reusedShards.Add(1)
+					return
+				}
+				markerFile := GetNinjaShardCacheFile(shardFile)
+				_ = c.fs.Remove(markerFile)
+				f, err := pathtools.OpenWithContentComparison(c.fs, shardFile)
 				if err != nil {
 					errorCh <- fmt.Errorf("error opening Ninja file shard: %s", err)
 					return
 				}
-				defer func() {
-					err := f.Close()
-					if err != nil {
-						errorCh <- err
-					}
-				}()
-				buf := bufio.NewWriterSize(f, 16*1024*1024)
-				defer func() {
-					err := buf.Flush()
-					if err != nil {
-						errorCh <- err
-					}
-				}()
+				buf := shardWriterPool.Get().(*bufio.Writer)
+				buf.Reset(f)
 				writer := newNinjaWriter(buf)
-				err = c.writeIncrementalModules(batchModules, writer)
+				writeErr := c.writeLocalBuildActions(writer, &localBuildActions{buildDefs: batchPhonys})
+				if writeErr == nil {
+					writeErr = c.writeIncrementalModules(batchModules, writer)
+				}
+				flushErr := buf.Flush()
+				buf.Reset(io.Discard)
+				shardWriterPool.Put(buf)
+				closeErr := f.Close()
+				err = errors.Join(writeErr, flushErr, closeErr)
+				if err == nil && canReuse {
+					err = c.writeNinjaShardCacheRecord(shardFile, fingerprint)
+				}
 				if err != nil {
 					errorCh <- err
+					return
 				}
-			}(file, batchModules)
+				if f.ContentChanged() {
+					contentChangedShards.Add(1)
+					shardBytesWritten.Add(uint64(f.BytesWritten()))
+				} else {
+					contentUnchangedShards.Add(1)
+				}
+			}(file, batchModules, batchPhonys)
 			nw.Subninja(file)
 		}
 
@@ -5693,10 +7162,17 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 		if len(errors) > 0 {
 			return proptools.MergeErrors(errors)
 		}
+		if c.GetIncrementalEnabled() && c.GetIncrementalAnalysis() {
+			fmt.Printf("blueprint: incremental modules restored=%d/%d (action-cache keys=%d); Ninja shards fingerprint-eligible=%d/%d reused=%d content-changed=%d content-unchanged=%d bytes-written=%.2f GiB\n",
+				restoredModules, len(modules), cacheableModules, cacheableShards.Load(), len(files), reusedShards.Load(),
+				contentChangedShards.Load(), contentUnchangedShards.Load(), float64(shardBytesWritten.Load())/(1024*1024*1024))
+		}
 		return nil
-	} else {
-		return c.writeModuleAction(modules, nw)
 	}
+	if err := c.writeLocalBuildActions(nw, phonys); err != nil {
+		return err
+	}
+	return c.writeModuleAction(modules, nw)
 }
 
 // A simplified version of parallelVisit where multiple calls to it can be run at the same time.
@@ -5865,8 +7341,51 @@ func (c *Context) writeOneModuleAction(module *moduleInfo, nw *ninjaWriter, buf 
 }
 
 func (c *Context) writeAllSingletonActions(nw *ninjaWriter) error {
+	return c.writeAllSingletonActionsToShards(nw, "")
+}
+
+func (c *Context) writeAllSingletonActionsToShards(nw *ninjaWriter, ninjaFileName string) (retErr error) {
 	c.BeginEvent("singletons")
 	defer c.EndEvent("singletons")
+
+	var singletonShardFiles []string
+	var singletonShardWriters []*bufio.Writer
+	var singletonShardClosers []io.WriteCloser
+	if ninjaFileName != "" {
+		singletonShardFiles = GetNinjaSingletonShardFiles(ninjaFileName)
+		singletonShardWriters = make([]*bufio.Writer, len(singletonShardFiles))
+		singletonShardClosers = make([]io.WriteCloser, len(singletonShardFiles))
+		defer func() {
+			for i, writer := range singletonShardWriters {
+				if writer == nil {
+					continue
+				}
+				retErr = errors.Join(retErr, writer.Flush(), singletonShardClosers[i].Close())
+			}
+		}()
+	}
+
+	writeSingletonBytes := func(info *singletonInfo, data []byte) error {
+		if ninjaFileName == "" {
+			_, err := nw.writer.Write(data)
+			return err
+		}
+		if len(data) == 0 {
+			return nil
+		}
+		shard := stableNinjaShardIndex(info.name, len(singletonShardFiles))
+		if singletonShardWriters[shard] == nil {
+			path := JoinPath(c.SrcDir(), singletonShardFiles[shard])
+			closer, err := pathtools.OpenWithContentComparison(c.fs, path)
+			if err != nil {
+				return err
+			}
+			singletonShardClosers[shard] = closer
+			singletonShardWriters[shard] = bufio.NewWriterSize(closer, 256*1024)
+		}
+		_, err := singletonShardWriters[shard].Write(data)
+		return err
+	}
 
 	buf := bytes.NewBuffer(nil)
 	var ninjaBytes []byte
@@ -5929,7 +7448,25 @@ func (c *Context) writeAllSingletonActions(nw *ninjaWriter) error {
 				c.keyValueStoreCache.writeNinjaStatements(info.buildActionCacheKey, ninjaBytes)
 			}
 		}
-		nw.writer.Write(ninjaBytes)
+		if err := writeSingletonBytes(info, ninjaBytes); err != nil {
+			return err
+		}
+	}
+
+	if ninjaFileName != "" {
+		wroteSubninja := false
+		for shard, writer := range singletonShardWriters {
+			if writer == nil {
+				continue
+			}
+			if err := nw.Subninja(singletonShardFiles[shard]); err != nil {
+				return err
+			}
+			wroteSubninja = true
+		}
+		if wroteSubninja {
+			return nw.BlankLine()
+		}
 	}
 
 	return nil
@@ -5956,6 +7493,54 @@ func (c *Context) SetEventStartedHook(hook func(string)) {
 
 func (c *Context) SetEventProgressHook(hook func(string, int, int)) {
 	c.eventProgressHook = hook
+}
+
+// MutatorVisitStats reports the number of module variants visited and elapsed
+// time for each mutator group when mutator visit statistics are enabled.
+type MutatorVisitStats struct {
+	StateCacheEnabled              bool
+	StateCacheSubsetEnabled        bool
+	IncrementalBuildActionsEnabled bool
+	IncrementalAnalysisEnabled     bool
+	SourceDeclarationGraphValid    bool
+	StateCacheDatabaseAvailable    bool
+	AffectedSourceDeclarations     uint64
+	AffectedSourceVariants         uint64
+	UnkeyedSourceVariants          uint64
+	StateCacheScannedVariants      uint64
+	FilteredVariants               uint64
+	StateCacheHits                 uint64
+	StateCacheMisses               uint64
+	StateCacheRestores             uint64
+	StateCacheRestoreErrors        uint64
+	VisitedVariants                uint64
+	StateCacheLookupElapsed        time.Duration
+	StateCacheRestoreElapsed       time.Duration
+	DependencyLookupCacheHits      uint64
+	DependencyLookupCacheMisses    uint64
+	DependencyLookupCacheElapsed   time.Duration
+	CallbackElapsed                time.Duration
+	DependencyUpdateModules        uint64
+	FullDependencyRefresh          bool
+	DependencyUpdateElapsed        time.Duration
+	Elapsed                        time.Duration
+}
+
+func (c *Context) SetMutatorVisitStatsEnabled(enabled bool) {
+	c.mutatorVisitStatsEnabled = enabled
+	if enabled {
+		c.mutatorVisitStats = make(map[string]MutatorVisitStats)
+	} else {
+		c.mutatorVisitStats = nil
+	}
+}
+
+func (c *Context) MutatorVisitStats() map[string]MutatorVisitStats {
+	stats := make(map[string]MutatorVisitStats, len(c.mutatorVisitStats))
+	for name, value := range c.mutatorVisitStats {
+		stats[name] = value
+	}
+	return stats
 }
 
 func (c *Context) SetBeforePrepareBuildActionsHook(hookFn func() error) {
@@ -6012,7 +7597,17 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
 		return true
 	})
 
-	parallelVisit(slices.Values(modules), unorderedVisitorImpl{}, parallelVisitLimit,
+	modulesToDeduplicate := modules
+	if c.GetIncrementalEnabled() && c.GetIncrementalAnalysis() && !c.incrementalProviderTest {
+		modulesToDeduplicate = make([]*moduleInfo, 0, len(modules))
+		for _, module := range modules {
+			if !module.incrementalRestored {
+				modulesToDeduplicate = append(modulesToDeduplicate, module)
+			}
+		}
+	}
+
+	parallelVisit(slices.Values(modulesToDeduplicate), unorderedVisitorImpl{}, parallelVisitLimit,
 		func(m *moduleInfo, pause pauseFunc) bool {
 			for _, def := range m.actionDefs.buildDefs {
 				if info, loaded := c.orderOnlyStrings.Load(def.OrderOnlyStrings); loaded {
