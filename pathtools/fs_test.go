@@ -771,6 +771,25 @@ func TestFsTruncate(t *testing.T) {
 	}
 }
 
+func TestOsFsFailedOpenReleasesSemaphore(t *testing.T) {
+	fs := NewOsFs(t.TempDir()).(*osFs)
+	fs.openFilesChan = make(chan bool, 1)
+
+	if _, err := fs.Open("missing"); err == nil {
+		t.Fatal("Open unexpectedly succeeded")
+	}
+	if got := len(fs.openFilesChan); got != 0 {
+		t.Fatalf("Open leaked %d file slots", got)
+	}
+
+	if _, err := fs.OpenFile(filepath.Join("missing", "child"), os.O_CREATE|os.O_WRONLY, 0600); err == nil {
+		t.Fatal("OpenFile unexpectedly succeeded")
+	}
+	if got := len(fs.openFilesChan); got != 0 {
+		t.Fatalf("OpenFile leaked %d file slots", got)
+	}
+}
+
 func readFile(fs FileSystem, path string) (string, error) {
 	r, err := fs.Open(path)
 	if err != nil {

@@ -216,6 +216,7 @@ func (fs *osFs) Open(name string) (ReaderAtSeekerCloser, error) {
 	fs.acquire()
 	f, err := os.Open(fs.toAbs(name))
 	if err != nil {
+		fs.release()
 		return nil, err
 	}
 	return &OsFile{f, fs}, nil
@@ -225,6 +226,7 @@ func (fs *osFs) OpenFile(name string, flag int, perm fs.FileMode) (WriteTruncate
 	fs.acquire()
 	f, err := os.OpenFile(fs.toAbs(name), flag, perm)
 	if err != nil {
+		fs.release()
 		return nil, err
 	}
 	return &OsFile{f, fs}, nil
