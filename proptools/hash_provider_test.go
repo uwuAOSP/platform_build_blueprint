@@ -29,6 +29,39 @@ func TestHashingMapGetsSameResults(t *testing.T) {
 	}
 }
 
+func TestHasherResetDropsPointerHashes(t *testing.T) {
+	type value struct {
+		Text string
+	}
+	data := &value{Text: "before"}
+	hasher := NewHasher()
+	hashValue := func(hasher *Hasher) error {
+		hasher.WriteString(data.Text)
+		return nil
+	}
+	if err := HashReference(hasher, data, hashValue); err != nil {
+		t.Fatal(err)
+	}
+	first := hasher.Sum64()
+
+	hasher.reset()
+	data.Text = "after"
+	if err := HashReference(hasher, data, hashValue); err != nil {
+		t.Fatal(err)
+	}
+	if second := hasher.Sum64(); first == second {
+		t.Fatalf("hash after reset did not reflect the changed pointed-to value: %x", second)
+	}
+	if len(hasher.ptrKeys) == 0 {
+		t.Fatal("expected pointer tracking to retain the keys until reset")
+	}
+
+	hasher.reset()
+	if len(hasher.ptrKeys) != 0 {
+		t.Fatalf("pointer tracking keys were not cleared: %d remain", len(hasher.ptrKeys))
+	}
+}
+
 func TestHashingNonSerializableTypesFails(t *testing.T) {
 	testCases := []struct {
 		name string

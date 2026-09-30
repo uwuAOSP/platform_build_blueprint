@@ -116,14 +116,17 @@ type Hasher struct {
 	hash.Hash64
 	int64Buf      [8]byte
 	ptrs          map[any]uint64
+	ptrKeys       []any
 	visiting      map[any]bool
+	typeHashType  reflect.Type
+	typeHash      Hash
+	typeHashes    map[reflect.Type]Hash
 	mapStateCache *mapState
 }
 
-// Preallocate the ptrs map in the hasher to a value slightly larger than the maximum number of pointers
-// seen in a call to CalculateHash to avoid allocations.  The hasher objects are reused in a pool, so the
-// total number of these maps will be small.
-const ptrsMapSize = 16384
+// Preallocate a modest number of pointer entries. Most values use far fewer than
+// the largest provider graphs, and the hasher pool retains these maps between calls.
+const ptrsMapSize = 256
 
 type mapState struct {
 	indexes []int
@@ -166,6 +169,7 @@ func HashReference(hasher *Hasher, addr any, hash func(*Hasher) error) error {
 		}
 		ptrHash = hasher.Sum64()
 		hasher.ptrs[addr] = ptrHash
+		hasher.ptrKeys = append(hasher.ptrKeys, addr)
 		delete(hasher.visiting, addr)
 	}
 
@@ -182,8 +186,14 @@ func (hasher *Hasher) reset() {
 		hasher.Hash64.Reset()
 	}
 
-	clear(hasher.ptrs)
+	for _, key := range hasher.ptrKeys {
+		delete(hasher.ptrs, key)
+	}
+	clear(hasher.ptrKeys)
+	hasher.ptrKeys = hasher.ptrKeys[:0]
 	clear(hasher.visiting)
+	hasher.typeHashType = nil
+	clear(hasher.typeHashes)
 }
 
 func (hasher *Hasher) WriteUint64(i uint64) {
@@ -241,11 +251,27 @@ func (hasher *Hasher) putMapState(s *mapState) {
 }
 
 func (hasher *Hasher) HashType(t reflect.Type) {
-	var h Hash
-	var err error
-	h, err = TypeHash(t)
+	if t == hasher.typeHashType {
+		hasher.WriteHash(hasher.typeHash)
+		return
+	}
+	if h, ok := hasher.typeHashes[t]; ok {
+		hasher.WriteHash(h)
+		return
+	}
+	h, err := TypeHash(t)
 	if err != nil {
 		panic(err)
+	}
+	if hasher.typeHashType == nil {
+		hasher.typeHashType = t
+		hasher.typeHash = h
+	} else {
+		if hasher.typeHashes == nil {
+			hasher.typeHashes = make(map[reflect.Type]Hash, 8)
+			hasher.typeHashes[hasher.typeHashType] = hasher.typeHash
+		}
+		hasher.typeHashes[t] = h
 	}
 	hasher.WriteHash(h)
 }
