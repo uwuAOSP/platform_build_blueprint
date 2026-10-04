@@ -228,6 +228,11 @@ func (m *moduleInfo) cacheModuleBuildActions(ctx gobtools.EncContext, buildActio
 	if moduleActionCacheDisabled(m.logicModule) {
 		return
 	}
+	if m.buildActionCacheKey == nil {
+		// Some modules can reach the cache write pass without having been assigned
+		// a cache key during restore. They are not eligible for action caching.
+		return
+	}
 
 	var providerHashes []ProviderHash
 

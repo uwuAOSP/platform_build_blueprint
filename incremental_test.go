@@ -1454,6 +1454,11 @@ func TestRestoreBuildActions(t *testing.T) {
 	}
 }
 
+func TestCacheModuleBuildActionsSkipsModuleWithoutCacheKey(t *testing.T) {
+	module := &moduleInfo{}
+	module.cacheModuleBuildActions(nil, nil)
+}
+
 func TestModuleActionCacheOptOutRegeneratesBuildActions(t *testing.T) {
 	ctx := incrementalSetup(t)
 	incrementalSetupForRestore(ctx, nil)
