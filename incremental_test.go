@@ -1177,6 +1177,15 @@ type moduleActionCacheOptOutTestModule struct {
 
 func (*moduleActionCacheOptOutTestModule) DisableModuleActionCache() {}
 
+type conditionalModuleActionCacheOptOutTestModule struct {
+	*incrementalModule
+	disabled bool
+}
+
+func (m *conditionalModuleActionCacheOptOutTestModule) ModuleActionCacheDisabled() bool {
+	return m.disabled
+}
+
 const incrementalModuleNinja string = `# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # Module:  MyIncrementalModule
 # Variant:
@@ -1466,6 +1475,31 @@ func TestModuleActionCacheOptOutRegeneratesBuildActions(t *testing.T) {
 	}
 	if !incInfo.logicModule.(*moduleActionCacheOptOutTestModule).GenerateBuildActionsCalled {
 		t.Fatal("module with action-cache opt-out did not regenerate build actions")
+	}
+}
+
+func TestConditionalModuleActionCacheOptOut(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("disabled_%t", disabled), func(t *testing.T) {
+			ctx := incrementalSetup(t)
+			incrementalSetupForRestore(ctx, nil)
+			ctx.SkipCloneModulesAfterMutators = true
+			incInfo := ctx.moduleGroupFromName("MyIncrementalModule", nil).modules.firstModule()
+			incModule := incInfo.logicModule.(*incrementalModule)
+			incInfo.logicModule = &conditionalModuleActionCacheOptOutTestModule{
+				incrementalModule: incModule,
+				disabled:          disabled,
+			}
+
+			_, errs := ctx.PrepareBuildActions(nil)
+			if len(errs) > 0 {
+				t.Fatalf("unexpected errors calling generateModuleBuildActions: %v", errs)
+			}
+
+			if incInfo.incrementalRestored == disabled {
+				t.Fatalf("module restored=%t with cache disabled=%t", incInfo.incrementalRestored, disabled)
+			}
+		})
 	}
 }
 

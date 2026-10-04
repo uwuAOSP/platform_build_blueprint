@@ -55,7 +55,7 @@ func (m *moduleInfo) restoreModuleBuildActions(ctx *Context) bool {
 		// Don't restore, incremental analysis is not enabled.
 		return false
 	}
-	if _, optedOut := m.logicModule.(ModuleActionCacheOptOut); optedOut {
+	if moduleActionCacheDisabled(m.logicModule) {
 		m.incrementalRestoreReason = "module_action_cache_opt_out"
 		return false
 	}
@@ -225,7 +225,7 @@ func (m *moduleInfo) calculateProviderHash() {
 }
 
 func (m *moduleInfo) cacheModuleBuildActions(ctx gobtools.EncContext, buildActionsCache *KeyValueStoreCache) {
-	if _, optedOut := m.logicModule.(ModuleActionCacheOptOut); optedOut {
+	if moduleActionCacheDisabled(m.logicModule) {
 		return
 	}
 
@@ -260,6 +260,16 @@ func (m *moduleInfo) cacheModuleBuildActions(ctx gobtools.EncContext, buildActio
 	if err != nil {
 		panic(err)
 	}
+}
+
+func moduleActionCacheDisabled(module Module) bool {
+	if _, optedOut := module.(ModuleActionCacheOptOut); optedOut {
+		return true
+	}
+	if conditionalOptOut, ok := module.(ModuleActionCacheOptOutCondition); ok {
+		return conditionalOptOut.ModuleActionCacheDisabled()
+	}
+	return false
 }
 
 type depProviders struct {

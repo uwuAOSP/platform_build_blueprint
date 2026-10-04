@@ -1110,9 +1110,17 @@ type ModuleActionCacheIdentity interface {
 
 // ModuleActionCacheOptOut marks modules whose build actions depend on mutable
 // module state that is not restored from the incremental build-action cache.
-// Such modules must regenerate their build actions on every build.
+// Such modules must regenerate their build actions on every build. Use
+// ModuleActionCacheOptOutCondition when only some module implementations need
+// to opt out.
 type ModuleActionCacheOptOut interface {
 	DisableModuleActionCache()
+}
+
+// ModuleActionCacheOptOutCondition allows a module to opt out of action caching
+// based on its concrete type or configuration.
+type ModuleActionCacheOptOutCondition interface {
+	ModuleActionCacheDisabled() bool
 }
 
 // @auto-generate: gob
