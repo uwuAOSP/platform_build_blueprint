@@ -472,7 +472,10 @@ func (g *gobGen) generate(source string, input []byte, verify bool) ([]byte, str
 		return nil, "", fmt.Errorf("source format error: %w", err)
 	}
 
-	if !verify {
+	// When processing multiple source files in one invocation, preserve the
+	// output accumulated from earlier files. Read the existing generated file
+	// only once, before the first generated section is added.
+	if !verify && len(input) == 0 {
 		input, err = os.ReadFile(outputFile)
 		if err != nil && !os.IsNotExist(err) {
 			return nil, "", err

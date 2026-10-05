@@ -17,6 +17,7 @@ package main
 import (
 	"bytes"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -239,6 +240,42 @@ func TestGenerate(t *testing.T) {
 	if !bytes.Equal(generatedBytes, expectedBytes) {
 		t.Errorf("Generated code from %s does not match expected output in %s.\nexpected:\n%s\ngot:\n%s",
 			sourceFile, expectedOutputFile, expectedBytes, generatedBytes)
+	}
+}
+
+func TestGenerateMultipleSourcesPreservesEarlierOutput(t *testing.T) {
+	dir := t.TempDir()
+	firstSource := filepath.Join(dir, "first.go")
+	secondSource := filepath.Join(dir, "second.go")
+
+	for source, content := range map[string]string{
+		firstSource: "package testpkg\n\n// @auto-generate: gob\ntype First struct { Value string }\n",
+		secondSource: "package testpkg\n\n// @auto-generate: gob\ntype Second struct { Value int }\n",
+	} {
+		if err := os.WriteFile(source, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	g := newGobGen()
+	g.sourceDir = dir
+
+	generated, outputFile, err := g.generate(firstSource, nil, false)
+	if err != nil {
+		t.Fatalf("generating %s: %v", firstSource, err)
+	}
+	generated, outputFile, err = g.generate(secondSource, generated, false)
+	if err != nil {
+		t.Fatalf("generating %s: %v", secondSource, err)
+	}
+
+	if outputFile != filepath.Join(dir, "testpkg_enc.go") {
+		t.Fatalf("unexpected output file %q", outputFile)
+	}
+	for _, marker := range []string{"// begin of first.go", "// begin of second.go"} {
+		if !strings.Contains(string(generated), marker) {
+			t.Errorf("generated output does not contain %q", marker)
+		}
 	}
 }
 
