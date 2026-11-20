@@ -17,6 +17,8 @@ package pathtools
 import (
 	"bufio"
 	"bytes"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"testing"
@@ -25,9 +27,10 @@ import (
 func TestEncodeDecodeGlobCache(t *testing.T) {
 	globs := []GlobResult{
 		{
-			Pattern: "*/*.go",
-			Deps:    []string{"a", "b"},
-			Matches: []string{"a/a.go", "b/b.go"},
+			Pattern:        "*/*.go",
+			Deps:           []string{"a", "b"},
+			Matches:        []string{"a/a.go", "b/b.go"},
+			MeowSourceOnly: true,
 		},
 		{
 			Pattern:  "*/*.c",
@@ -65,5 +68,64 @@ func TestEncodeDecodeGlobCache(t *testing.T) {
 
 	if !reflect.DeepEqual(globs, decodedGlobs) {
 		t.Errorf("expected globs %#v, got %#v", globs, decodedGlobs)
+	}
+}
+
+func TestMeowGlobInvalidation(t *testing.T) {
+	for _, operation := range []string{"add", "delete"} {
+		for _, sourceOnly := range []bool{false, true} {
+			name := operation + "/regular"
+			if sourceOnly {
+				name = operation + "/executor-managed"
+			}
+			t.Run(name, func(t *testing.T) {
+				dir := t.TempDir()
+				original := filepath.Join(dir, "original.java")
+				if err := os.WriteFile(original, []byte("class Original {}"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				cached, err := glob(OsFs, filepath.Join(dir, "*.java"), nil, FollowSymlinks)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cached.MeowSourceOnly = sourceOnly
+				var cache bytes.Buffer
+				if err := WriteGlobFile(&cache, []GlobResult{cached}); err != nil {
+					t.Fatal(err)
+				}
+				if operation == "add" {
+					if err := os.WriteFile(filepath.Join(dir, "added.java"), nil, 0600); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.Remove(original); err != nil {
+					t.Fatal(err)
+				}
+				// Force a membership check independently of filesystem timestamp resolution.
+				changed, err := CheckForChangedGlobsForMeow(OsFs, bytes.NewReader(cache.Bytes()), 0)
+				if sourceOnly {
+					if changed || err != nil {
+						t.Fatalf("executor-managed glob requested Soong: %v, %v", changed, err)
+					}
+				} else if !changed {
+					t.Fatal("ordinary configuration glob must rerun Soong")
+				}
+				changed, _ = CheckForChangedGlobs(OsFs, bytes.NewReader(cache.Bytes()), 0)
+				if !changed {
+					t.Fatal("traditional builds must continue checking all globs")
+				}
+			})
+		}
+	}
+}
+
+func TestMeowGlobCacheDecodeFailureInvalidates(t *testing.T) {
+	var cache bytes.Buffer
+	if err := WriteGlobFile(&cache, []GlobResult{{Pattern: "*.java", MeowSourceOnly: true}}); err != nil {
+		t.Fatal(err)
+	}
+	data := cache.Bytes()
+	changed, err := CheckForChangedGlobsForMeow(OsFs, bytes.NewReader(data[:len(data)-1]), 0)
+	if !changed || err == nil {
+		t.Fatalf("truncated cache accepted: changed=%v err=%v", changed, err)
 	}
 }

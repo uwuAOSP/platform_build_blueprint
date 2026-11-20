@@ -26,6 +26,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
@@ -33,7 +34,7 @@ import (
 // globFileMagic is the header used at the top of the glob cache file.  Any change to the
 // on-disk format of the cache should be accompanied by a change to the magic string to
 // avoid exposing the decoder to an unexpected format.
-const globFileMagic = "Soong glob file version 1\n"
+const globFileMagic = "Soong glob file version 2\n"
 
 // globFileEncoder writes a list of globs to a cache file.  It's helpers are conceptually
 // similar to the ones in the gobtools package, and the encoder is similar to the
@@ -102,6 +103,13 @@ func (e *globFileEncoder) encode(globs []GlobResult) error {
 		}
 		err = e.writeStringList(glob.Deps)
 		if err != nil {
+			return err
+		}
+		var sourceOnly byte
+		if glob.MeowSourceOnly {
+			sourceOnly = 1
+		}
+		if err := e.w.WriteByte(sourceOnly); err != nil {
 			return err
 		}
 	}
@@ -197,6 +205,11 @@ func (d *globFileDecoder) decode() (GlobResult, error) {
 	if err != nil {
 		return GlobResult{}, err
 	}
+	sourceOnly, err := d.r.ReadByte()
+	if err != nil {
+		return GlobResult{}, err
+	}
+	glob.MeowSourceOnly = sourceOnly != 0
 	return glob, err
 }
 
@@ -293,6 +306,17 @@ func checkIfGlobChanged(fs FileSystem, cachedGlob GlobResult, globsTimeMicros in
 // rerunning analysis.  If a modified glob is found an error is also returned that contains
 // a helpful message to print to the console.
 func CheckForChangedGlobs(fs FileSystem, r io.Reader, globsTimeMicros int64) (bool, error) {
+	return checkForChangedGlobs(fs, r, globsTimeMicros, false)
+}
+
+// CheckForChangedGlobsForMeow skips source globs whose compile edges are
+// dynamically refreshed by Runa. Non-source globs retain Soong's normal
+// reanalysis behavior.
+func CheckForChangedGlobsForMeow(fs FileSystem, r io.Reader, globsTimeMicros int64) (bool, error) {
+	return checkForChangedGlobs(fs, r, globsTimeMicros, true)
+}
+
+func checkForChangedGlobs(fs FileSystem, r io.Reader, globsTimeMicros int64, skipMeowSourceOnly bool) (bool, error) {
 	globsFileDecoder, err := newGlobFileDecoder(bufio.NewReaderSize(r, 16*1024*1024))
 	if err != nil {
 		if errors.Is(err, errBadMagic) {
@@ -304,7 +328,7 @@ func CheckForChangedGlobs(fs FileSystem, r io.Reader, globsTimeMicros int64) (bo
 	globsChan := make(chan GlobResult)
 	wg := sync.WaitGroup{}
 
-	hasChangedGlobs := false
+	var hasChangedGlobs atomic.Bool
 	var errFromCheckGlobMutex sync.Mutex
 	var errFromCheckGlob error
 
@@ -312,9 +336,12 @@ func CheckForChangedGlobs(fs FileSystem, r io.Reader, globsTimeMicros int64) (bo
 		wg.Add(1)
 		go func() {
 			for cachedGlob := range globsChan {
+				if skipMeowSourceOnly && cachedGlob.MeowSourceOnly {
+					continue
+				}
 				// If we've already determined we have changed globs, just finish consuming
 				// the channel without doing any more checks.
-				if hasChangedGlobs {
+				if hasChangedGlobs.Load() {
 					continue
 				}
 				changed, err := checkIfGlobChanged(fs, cachedGlob, globsTimeMicros)
@@ -324,7 +351,7 @@ func CheckForChangedGlobs(fs FileSystem, r io.Reader, globsTimeMicros int64) (bo
 					errFromCheckGlobMutex.Unlock()
 				}
 				if changed {
-					hasChangedGlobs = true
+					hasChangedGlobs.Store(true)
 				}
 			}
 			wg.Done()
@@ -343,11 +370,11 @@ func CheckForChangedGlobs(fs FileSystem, r io.Reader, globsTimeMicros int64) (bo
 		return true, errFromCheckGlob
 	}
 
-	if errFromDecoder() != nil {
-		return true, fmt.Errorf("failed to decode glob file: %w", errFromCheckGlob)
+	if err := errFromDecoder(); err != nil {
+		return true, fmt.Errorf("failed to decode glob file: %w", err)
 	}
 
-	return false, nil
+	return hasChangedGlobs.Load(), nil
 }
 
 type RestoredGlobsMetrics struct {

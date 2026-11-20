@@ -198,7 +198,9 @@ type Context struct {
 	// cache deps modified to determine whether cachedSortedModuleGroups needs to be recalculated
 	cachedDepsModified bool
 
-	globs syncmap.SyncMap[globKey, globsMapEntry]
+	globs              syncmap.SyncMap[globKey, globsMapEntry]
+	meowSourceGlobs    syncmap.SyncMap[globKey, bool]
+	nonMeowSourceGlobs syncmap.SyncMap[globKey, bool]
 
 	restoredGlobsFromCache map[globKey]pathtools.GlobResult
 	restoredGlobMetrics    pathtools.RestoredGlobsMetrics
@@ -5473,7 +5475,7 @@ func (c *Context) restoreSingleton(info *singletonInfo) {
 	}
 
 	for _, glob := range data.GlobCache {
-		result, err := c.glob(glob.Pattern, glob.Excludes)
+		result, err := c.globForCachedBuildActions(glob.Pattern, glob.Excludes)
 		if err != nil {
 			panic(newPanicErrorf(err, "failed to glob for cached singleton: %s %s %v", info.name, glob.Pattern, glob.Excludes))
 		}

@@ -571,7 +571,25 @@ func (d *baseModuleContext) Failed() bool {
 
 func (d *baseModuleContext) GlobWithDeps(pattern string,
 	excludes []string) ([]string, error) {
-	result, err := d.context.glob(pattern, excludes)
+	return d.globWithDeps(pattern, excludes, false)
+}
+
+// GlobWithDepsForMeowSource marks a source glob as dynamically refreshed by
+// Runa during Meow builds. It is intentionally not part of ModuleContext so
+// callers outside Soong's source-path helpers retain the standard API.
+func (d *baseModuleContext) GlobWithDepsForMeowSource(pattern string,
+	excludes []string) ([]string, error) {
+	return d.globWithDeps(pattern, excludes, true)
+}
+
+func (d *baseModuleContext) globWithDeps(pattern string, excludes []string, meowSource bool) ([]string, error) {
+	var result []string
+	var err error
+	if meowSource {
+		result, err = d.context.globForMeowSource(pattern, excludes)
+	} else {
+		result, err = d.context.glob(pattern, excludes)
+	}
 	if err == nil && d.context.incrementalEnabled {
 		hash, err := proptools.CalculateHash(stringList(result))
 		if err != nil {

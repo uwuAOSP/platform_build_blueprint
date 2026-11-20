@@ -50,7 +50,51 @@ func (c *Context) glob(pattern string, excludes []string) ([]string, error) {
 	sort.Strings(excludes)
 
 	key := globToKey(pattern, excludes)
+	c.nonMeowSourceGlobs.Store(key, true)
+	return c.globWithKey(key, pattern, excludes)
+}
 
+func (c *Context) globForMeowSource(pattern string, excludes []string) ([]string, error) {
+	excludes = slices.Clone(excludes)
+	sort.Strings(excludes)
+	key := globToKey(pattern, excludes)
+	c.meowSourceGlobs.Store(key, true)
+	return c.globWithKey(key, pattern, excludes)
+}
+
+// Validating a cached module's source list is not a new configuration use of
+// that glob. Preserve the previous (globally checked) source-only classification
+// when its cached declaration is available. A real regular use still calls
+// glob and overrides source-only classification in WriteGlobFile. Otherwise
+// inspect membership without registering a consumer: the cached actions may be
+// rejected, in which case only freshly generated actions own the new glob.
+func (c *Context) globForCachedBuildActions(pattern string, excludes []string) ([]string, error) {
+	excludes = slices.Clone(excludes)
+	sort.Strings(excludes)
+	key := globToKey(pattern, excludes)
+	if previous, ok := c.restoredGlobsFromCache[key]; ok && previous.MeowSourceOnly {
+		return c.globForMeowSource(pattern, excludes)
+	}
+	return c.globWithKey(key, pattern, excludes)
+}
+
+// recordRestoredBuildActionGlobs commits uses only after all cache validation
+// has succeeded. Unknown or ordinary cached consumers must still invalidate
+// Soong, even if another module dynamically consumes the same glob.
+func (c *Context) recordRestoredBuildActionGlobs(globs []globResultCache) {
+	for _, glob := range globs {
+		excludes := slices.Clone(glob.Excludes)
+		sort.Strings(excludes)
+		key := globToKey(glob.Pattern, excludes)
+		if previous, ok := c.restoredGlobsFromCache[key]; ok && previous.MeowSourceOnly {
+			c.meowSourceGlobs.Store(key, true)
+		} else {
+			c.nonMeowSourceGlobs.Store(key, true)
+		}
+	}
+}
+
+func (c *Context) globWithKey(key globKey, pattern string, excludes []string) ([]string, error) {
 	// Try to get existing glob from the stored results, compute it otherwise
 	entry, exists := c.globs.LoadOrCompute(key, func() globsMapEntry {
 		// Check if the glob was restored from the cache
@@ -91,7 +135,11 @@ func (c *Context) WriteGlobFile(finalOutFile string, startTime time.Time) error 
 	globs := make([]pathtools.GlobResult, 0, len(globKeys))
 	for _, key := range globKeys {
 		entry, _ := c.globs.Load(key)
-		globs = append(globs, entry.result)
+		result := entry.result
+		_, sourceOnly := c.meowSourceGlobs.Load(key)
+		_, regularUse := c.nonMeowSourceGlobs.Load(key)
+		result.MeowSourceOnly = sourceOnly && !regularUse
+		globs = append(globs, result)
 	}
 
 	globsFile, err := os.Create(finalOutFile + ".globs")
@@ -146,7 +194,11 @@ func (c *Context) RestoreGlobsFromCache(finalOutFile string) error {
 
 	c.restoredGlobsFromCache = make(map[globKey]pathtools.GlobResult, len(globs))
 	for _, glob := range globs {
-		c.restoredGlobsFromCache[globToKey(glob.Pattern, glob.Excludes)] = glob
+		key := globToKey(glob.Pattern, glob.Excludes)
+		c.restoredGlobsFromCache[key] = glob
+		if glob.MeowSourceOnly {
+			c.meowSourceGlobs.Store(key, true)
+		}
 	}
 
 	return nil

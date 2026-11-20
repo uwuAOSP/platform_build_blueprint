@@ -40,6 +40,9 @@ type GlobResult struct {
 
 	// Deps is the list of files or directories that must be depended on to regenerate the glob.
 	Deps []string
+	// MeowSourceOnly marks globs whose membership is refreshed by Runa when
+	// running through Meow. Soong still checks these globs for ordinary builds.
+	MeowSourceOnly bool
 }
 
 // LINT.ThenChange(glob_cache.go)

@@ -335,7 +335,7 @@ func (c *Context) sourceModuleGlobsChanged(globs []globResultCache, currentHashe
 		key := globToKey(glob.Pattern, glob.Excludes)
 		hash, exists := currentHashes[key]
 		if !exists {
-			matches, err := c.glob(glob.Pattern, glob.Excludes)
+			matches, err := c.globForCachedBuildActions(glob.Pattern, glob.Excludes)
 			if err != nil {
 				return false, err
 			}

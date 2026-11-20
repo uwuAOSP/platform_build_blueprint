@@ -46,14 +46,14 @@ type Args struct {
 	ModuleDebugFile            string
 	IncrementalBuildActions    bool
 	IncrementalDebugMissesOnly bool
-	// ShardNinja enables reusable module and singleton Ninja shards for uni.
+	// ShardNinja enables reusable module and singleton Ninja shards for meow.
 	ShardNinja              bool
 	IncrementalProviderTest bool
 	IncrementalDebugFile    string
 	PartialAnalysisTargets  string
 }
 
-func useUniNinjaShards(args Args) bool {
+func useMeowNinjaShards(args Args) bool {
 	return args.ShardNinja && !args.EmptyNinjaFile && !strings.Contains(args.OutFile, "bootstrap.ninja")
 }
 
@@ -203,7 +203,7 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 	} else {
 		var f io.WriteCloser
 		var err error
-		if useUniNinjaShards(args) {
+		if useMeowNinjaShards(args) {
 			f, err = pathtools.OpenWithContentComparison(pathtools.OsFs, blueprint.JoinPath(ctx.SrcDir(), args.OutFile))
 		} else {
 			f, err = os.OpenFile(blueprint.JoinPath(ctx.SrcDir(), args.OutFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, blueprint.OutFilePermissions)
@@ -216,7 +216,7 @@ func RunBlueprint(args Args, stopBefore StopBefore, ctx *blueprint.Context, conf
 		out = buf
 	}
 
-	if err := ctx.WriteBuildFile(out, useUniNinjaShards(args), args.OutFile); err != nil {
+	if err := ctx.WriteBuildFile(out, useMeowNinjaShards(args), args.OutFile); err != nil {
 		return nil, fmt.Errorf("error writing Ninja file contents: %s", err)
 	}
 

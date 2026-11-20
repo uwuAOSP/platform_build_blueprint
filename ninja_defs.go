@@ -180,6 +180,7 @@ type BuildParams struct {
 	OrderOnly       []string          // The list of order-only dependencies.
 	Validations     []string          // The list of validations to run when this rule runs.
 	Args            map[string]string // The variable/value pairs to set.
+	Variables       map[string]string // Additional edge-scoped Ninja bindings.
 	Default         bool              // Output a ninja default statement
 	PhonyOutput     bool              // This is a phony_output
 }
@@ -496,6 +497,13 @@ func parseBuildParams(scope scope, params *BuildParams,
 
 	if len(tags) > 0 {
 		setVariable("tags", simpleNinjaString(formatTags(tags, rule)))
+	}
+	for name, value := range params.Variables {
+		ninjaValue, err := parseNinjaString(scope, value)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing variable %q: %s", name, err)
+		}
+		setVariable(name, ninjaValue)
 	}
 
 	argNameScope := rule.scope()

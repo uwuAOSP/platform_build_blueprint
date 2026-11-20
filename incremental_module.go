@@ -124,7 +124,7 @@ func (m *moduleInfo) restoreModuleBuildActions(ctx *Context) bool {
 		return false
 	}
 	for _, glob := range data.GlobCache {
-		result, err := ctx.glob(glob.Pattern, glob.Excludes)
+		result, err := ctx.globForCachedBuildActions(glob.Pattern, glob.Excludes)
 		if err != nil {
 			panic(newPanicErrorf(err, "failed to glob for cached module: %s %s %v", m.Name(), glob.Pattern, glob.Excludes))
 		}
@@ -139,6 +139,7 @@ func (m *moduleInfo) restoreModuleBuildActions(ctx *Context) bool {
 			return false
 		}
 	}
+	ctx.recordRestoredBuildActionGlobs(data.GlobCache)
 	m.globCache = data.GlobCache
 
 	// Restore the module from the cache.
