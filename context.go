@@ -146,9 +146,10 @@ type Context struct {
 	context.Context
 
 	// Used for metrics-related event logging.
-	EventHandler      *metrics.EventHandler
-	eventStartedHook  func(string)
-	eventProgressHook func(string, int, int)
+	EventHandler       *metrics.EventHandler
+	eventStartedHook   func(string)
+	eventProgressHook  func(string, int, int)
+	moduleProgressHook func(int, int)
 
 	BeforePrepareBuildActionsHook func() error
 
@@ -5153,6 +5154,15 @@ func (c *Context) generateModuleBuildActions(config interface{},
 
 	c.BeginEvent("generateModuleBuildActions")
 	defer c.EndEvent("generateModuleBuildActions")
+	var progress *moduleProgressReporter
+	if c.moduleProgressHook != nil {
+		total := 0
+		for range c.iterateAllVariants() {
+			total++
+		}
+		progress = newModuleProgressReporter(total, c.moduleProgressHook)
+		defer progress.finish()
+	}
 	var deps []string
 	var errs []error
 
@@ -5177,6 +5187,9 @@ func (c *Context) generateModuleBuildActions(config interface{},
 
 	visitErrs := parallelVisit(c.iterateAllVariants(), bottomUpVisitor, parallelVisitLimit,
 		func(module *moduleInfo, pause pauseFunc) bool {
+			if progress != nil {
+				defer progress.completed.Add(1)
+			}
 			module.cachedUniqueName = c.nameInterface.UniqueName(newNamespaceContext(module), module.group.name)
 			sanitizedName := toNinjaName(module.cachedUniqueName)
 			sanitizedVariant := toNinjaName(module.variant.name)
@@ -7503,6 +7516,12 @@ func (c *Context) SetEventStartedHook(hook func(string)) {
 
 func (c *Context) SetEventProgressHook(hook func(string, int, int)) {
 	c.eventProgressHook = hook
+}
+
+// SetModuleProgressHook enables bounded, sampled progress for interactive UIs.
+// No reporter, counters or polling goroutine are created when this is unset.
+func (c *Context) SetModuleProgressHook(hook func(int, int)) {
+	c.moduleProgressHook = hook
 }
 
 // MutatorVisitStats reports the number of module variants visited and elapsed
